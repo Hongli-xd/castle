@@ -1,0 +1,30 @@
+# sandboxd 配置示例（key = value；环境变量 SBXD_* 可覆盖部分键）
+listen  = "127.0.0.1:8080"
+data_dir = "./data"
+
+# 与 Docker 守护进程的连接（留空自动探测标准位置）
+# docker_host = "unix:///var/run/docker.sock"
+
+# 默认规格（请求未指定时）
+defaults.cpu_millicores  = 1000
+defaults.memory_mib      = 512
+defaults.timeout_seconds = 3600
+
+# 平台默认配额（租户可按租户覆盖）
+quota.max_sandboxes      = 10
+quota.max_cpu_millicores = 8000
+quota.max_memory_mib     = 8192
+quota.max_snapshots      = 20
+
+# 预热池：每模板保持的预热沙箱数（0 关闭）
+pool.enabled = true
+pool.size    = 2
+
+# 磁盘配额在 overlayfs/ext4 上无法强制；保留 true 时请求 disk_mib 的创建
+# 会被拒绝。设为 false 表示你已理解并接受该风险（见 docs/THREAT-MODEL.md）。
+enforce_disk_quota = true
+
+# 首次启动自动播种默认模板所需的本机镜像（可选）
+# bootstrap.image = "alpine:3.22"
+# 运维轮换的管理员 Key（可选；缺省则首次启动生成并打印一次）
+# bootstrap_admin_key = "sk_..."

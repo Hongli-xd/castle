@@ -1,0 +1,6 @@
+bin/
+data/
+*.log
+node_modules/
+*.conf
+!sandboxd.conf.example

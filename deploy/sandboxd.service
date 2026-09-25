@@ -1,0 +1,14 @@
+[Unit]
+Description=sandboxd agent sandbox runtime
+After=docker.service
+Requires=docker.service
+
+[Service]
+ExecStart=/usr/local/bin/sandboxd -config /etc/sandboxd/sandboxd.conf
+Restart=always
+RestartSec=2
+LimitNOFILE=65536
+StateDirectory=sandboxd
+
+[Install]
+WantedBy=multi-user.target
