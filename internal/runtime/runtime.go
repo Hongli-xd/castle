@@ -1,0 +1,142 @@
+// Package runtime defines the backend abstraction between the control plane
+// (which owns state) and the machinery that actually isolates workloads.
+//
+// Two implementations ship:
+//   - oci: Docker Engine API containers. Runs anywhere Docker runs, including
+//     colima/Docker Desktop on macOS for development. Kernel is shared with
+//     the host — this is the "strong process isolation" tier.
+//   - firecracker: microVM-per-sandbox with kernel-level isolation and
+//     memory snapshots. Requires Linux + KVM; ships as a compile-checked
+//     skeleton and registers itself only when /dev/kvm is present.
+//
+// The interface refuses to express what a backend cannot enforce: egress
+// allowlists, for example, return apperr.Unimplemented rather than creating
+// a sandbox the caller believes is restricted when it is not.
+package runtime
+
+import (
+	"context"
+	"time"
+
+	"sandcastle.dev/sandcastle/internal/apperr"
+	"sandcastle.dev/sandcastle/internal/domain"
+)
+
+// CreateRequest carries everything a backend needs to realize a sandbox.
+type CreateRequest struct {
+	Name          string // backend-native object name, e.g. sandboxd-<id>
+	Image         string // backend-native image reference
+	CPUMillicores int    // 1000 = one full core
+	MemoryMiB     int    // hard cap
+	Env           map[string]string
+	User          string            // "" = image default
+	WorkDir       string            // "" = image default
+	Labels        map[string]string // ownership tags; backends MUST set these — orphan recovery depends on them
+}
+
+// Status is the backend's view of a live object. The reconciler trusts this
+// over local state.
+type Status struct {
+	Running   bool
+	Paused    bool
+	Raw       string // backend-native status text for logs/events
+	ExitCode  int
+	OOMKilled bool
+	StartedAt time.Time
+}
+
+// ExecRequest is one command execution inside a sandbox.
+type ExecRequest struct {
+	Argv      []string          // argv[0] must be resolved inside the sandbox
+	Env       map[string]string // additional env for this exec only
+	User      string            // "" = sandbox default
+	WorkDir   string            // "" = sandbox workdir
+	Timeout   time.Duration     // must be > 0; hard deadline
+	MaxOutput int               // bytes; 0 = backend default (1 MiB)
+}
+
+// ExecResult is the outcome of one execution.
+type ExecResult struct {
+	ExitCode  int           `json:"exit_code"`
+	Stdout    []byte        `json:"stdout"`
+	Stderr    []byte        `json:"stderr"`
+	Duration  time.Duration `json:"duration_ns"`
+	Truncated bool          `json:"truncated"`
+	TimedOut  bool          `json:"timed_out"`
+}
+
+// FileInfo describes one directory entry.
+type FileInfo struct {
+	Name  string `json:"name"`
+	IsDir bool   `json:"is_dir"`
+	Size  int64  `json:"size,omitempty"`
+	Mode  string `json:"mode,omitempty"`
+}
+
+type PutFileRequest struct {
+	Path    string // absolute in-sandbox path (file, not dir)
+	Content []byte
+	Mode    uint32 // octal, e.g. 0o644; 0 = 0o644
+}
+
+// Orphan describes a backend object carrying our ownership labels, used by
+// crash recovery to adopt or reap objects after a daemon death.
+type Orphan struct {
+	Ref    string
+	Labels map[string]string
+	Status Status
+}
+
+// Backend is the pluggable isolation driver. All methods must be safe for
+// concurrent use and must return *apperr.E errors.
+type Backend interface {
+	Name() string
+	// Ping verifies the backend is reachable; /readyz fails without it.
+	Ping(ctx context.Context) error
+
+	// Lifecycle
+	Create(ctx context.Context, req CreateRequest) (ref string, err error)
+	Start(ctx context.Context, ref string) error
+	Pause(ctx context.Context, ref string) error
+	Resume(ctx context.Context, ref string) error
+	Stop(ctx context.Context, ref string, force bool) error
+	Remove(ctx context.Context, ref string) error
+	Inspect(ctx context.Context, ref string) (Status, error)
+	// Rename rebrands a backend object without recreating it — the warm
+	// pool hands a pristine object to a tenant this way.
+	Rename(ctx context.Context, ref, newName string) error
+
+	// Execution and files
+	Exec(ctx context.Context, ref string, req ExecRequest) (*ExecResult, error)
+	PutFile(ctx context.Context, ref string, req PutFileRequest) error
+	GetFile(ctx context.Context, ref, path string, maxSize int64) ([]byte, error)
+	ListDir(ctx context.Context, ref, path string) ([]FileInfo, error)
+	DeletePath(ctx context.Context, ref, path string) error
+
+	// Snapshots and images
+	Commit(ctx context.Context, ref, tag string) (imageRef string, sizeBytes int64, err error)
+	HasImage(ctx context.Context, imageRef string) (bool, error)
+	RemoveImage(ctx context.Context, imageRef string) error
+	ImportRootfs(ctx context.Context, rootfsDir, tag string) (imageRef string, sizeBytes int64, err error)
+
+	// Recovery
+	// Orphans lists backend objects labeled as ours, whatever their state,
+	// so the reconciler can adopt or reap them after a daemon crash.
+	Orphans(ctx context.Context) ([]Orphan, error)
+}
+
+// SpecLimits mirrors domain limits that backends need for admission.
+type SpecLimits = domain.Limits
+
+// CheckEgress enforces the honest-refusal contract: a backend that cannot
+// truly enforce a policy must refuse the create.
+func CheckEgress(b Backend, policy domain.EgressPolicy) error {
+	switch policy.Mode {
+	case "", domain.EgressNone:
+		return nil
+	case domain.EgressAllowlist:
+		return apperr.Unimpl("backend %q cannot enforce egress allowlists; use egress=none or deploy the firecracker backend (roadmap)", b.Name())
+	default:
+		return apperr.Invalid("unknown egress mode %q", policy.Mode)
+	}
+}
