@@ -1,0 +1,12 @@
+{
+  "name": "pi-sbx",
+  "private": true,
+  "type": "module",
+  "description": "Route pi's bash tool into a sandboxd sandbox (agent runtime isolation)",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
