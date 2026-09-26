@@ -20,6 +20,15 @@ quota.max_snapshots      = 20
 pool.enabled = true
 pool.size    = 2
 
+# 平台默认空闲超时（秒；0=默认关闭，spec 可逐沙箱覆盖）
+defaults.idle_timeout_seconds = 0
+
+# 对 paused 沙箱的请求自动先恢复再执行（DSec §6.3 语义）
+auto_resume = true
+
+# 暂停时临时下调内存上限以触发内核回收（恢复前还原）
+pause_reclaim = true
+
 # 磁盘配额在 overlayfs/ext4 上无法强制；保留 true 时请求 disk_mib 的创建
 # 会被拒绝。设为 false 表示你已理解并接受该风险（见 docs/THREAT-MODEL.md）。
 enforce_disk_quota = true

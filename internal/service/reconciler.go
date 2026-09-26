@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"sandcastle.dev/sandcastle/internal/apperr"
@@ -57,20 +58,31 @@ func (s *Service) compactLoop() {
 	}
 }
 
-// sweepExpired stops sandboxes past their TTL. TTL exists so abandoned
-// sandboxes cannot burn quota forever — expiry is a governance event, not
-// an error, and is audited as such.
+// sweepExpired stops sandboxes past their hard TTL or their idle timeout
+// (DSec §2.3 lifetime policy: both exist so abandoned or long-idle
+// sandboxes cannot pin memory and quota forever — expiry is a governance
+// event, not an error, and is audited as such).
 func (s *Service) sweepExpired() {
 	now := time.Now()
-	var expired []*domain.Sandbox
+	type due struct {
+		sb   *domain.Sandbox
+		idle bool
+	}
+	var expired []due
 	s.St.ForEachSandbox(func(sb *domain.Sandbox) bool {
-		if !sb.State.Terminal() && sb.Expired(now) {
-			c := sb
-			expired = append(expired, c)
+		if sb.State.Terminal() {
+			return true
+		}
+		switch {
+		case sb.Expired(now):
+			expired = append(expired, due{sb: sb})
+		case sb.IdleExpired(now) && (sb.State == domain.StateRunning || sb.State == domain.StatePaused):
+			expired = append(expired, due{sb: sb, idle: true})
 		}
 		return true
 	})
-	for _, sb := range expired {
+	for _, d := range expired {
+		sb := d.sb
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		if sb.Backend.Ref != "" {
 			_, _ = s.St.UpdateSandbox(sb.ID, -1, func(x *domain.Sandbox) error {
@@ -89,7 +101,13 @@ func (s *Service) sweepExpired() {
 			return nil
 		})
 		if err == nil {
-			_ = s.Audit.Record(sb.TenantID, sb.ID, "system", domain.ActSandboxExpire, map[string]string{"ttl_seconds": itoa(sb.Spec.TimeoutSeconds)})
+			action := domain.ActSandboxExpire
+			detail := map[string]string{"ttl_seconds": itoa(sb.Spec.TimeoutSeconds)}
+			if d.idle {
+				action = domain.ActSandboxIdleExpire
+				detail = map[string]string{"idle_timeout_seconds": itoa(sb.Spec.IdleTimeoutSeconds)}
+			}
+			_ = s.Audit.Record(sb.TenantID, sb.ID, "system", action, detail)
 		}
 		cancel()
 	}
@@ -182,6 +200,13 @@ func (s *Service) reconcile(ctx context.Context, atBoot bool) {
 			}
 			continue
 		}
+		if isComposeName(o.Ref) {
+			// template-composition scratch/helper containers have no store
+			// record either; leftovers mean a daemon died mid-compose
+			_ = s.Backend.Remove(ctx, o.Ref)
+			reaped++
+			continue
+		}
 		sid := o.Labels["sandbox.id"]
 		if sid == "" {
 			continue // ours by product label but not attributable; leave for ops
@@ -216,4 +241,9 @@ func backendToState(st runtime.Status) domain.SandboxState {
 // identity for pool items because labels cannot be updated on a container.
 func isWarmName(ref string) bool {
 	return len(ref) > 14 && ref[:14] == "sandboxd-warm-"
+}
+
+// isComposeName matches template-composition scratch containers.
+func isComposeName(ref string) bool {
+	return strings.HasPrefix(ref, "sandcastle-compose-")
 }

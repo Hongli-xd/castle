@@ -95,3 +95,26 @@ func validatePath(p string) error {
 	}
 	return nil
 }
+
+// validateCleanupPaths enforces the pack-cleanup contract: absolute, no
+// traversal, bounded count, and never a system root — deleting /usr inside
+// a packed environment is a footgun the platform must refuse.
+func validateCleanupPaths(paths []string) error {
+	if len(paths) > 16 {
+		return apperr.Invalid("pack.cleanup supports at most 16 paths")
+	}
+	for _, p := range paths {
+		if err := validatePath(p); err != nil {
+			return err
+		}
+		if p == "/" {
+			return apperr.Invalid("pack.cleanup refuses to delete /")
+		}
+		for _, forbidden := range []string{"/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/proc", "/root", "/sbin", "/sys", "/usr", "/var"} {
+			if p == forbidden {
+				return apperr.Invalid("pack.cleanup refuses system path %s", p)
+			}
+		}
+	}
+	return nil
+}

@@ -30,6 +30,42 @@ func (s *Service) loadOwned(tenantID, sandboxID string) (*domain.Sandbox, error)
 	return sb, nil
 }
 
+// requireRunning enforces the running precondition, with DSec §6.3
+// transparent-resume semantics: a request to a paused sandbox resumes it
+// first (config auto_resume, default on) instead of bouncing with 409.
+// A frozen workload is an implementation detail of pause, not something
+// callers should have to manage.
+func (s *Service) requireRunning(ctx context.Context, tenantID, keyID string, sb *domain.Sandbox) (*domain.Sandbox, error) {
+	if sb.State == domain.StateRunning {
+		return sb, nil
+	}
+	if sb.State == domain.StatePaused && s.Cfg.AutoResume {
+		if _, err := s.ResumeSandbox(ctx, tenantID, keyID, sb.ID); err != nil {
+			return nil, err
+		}
+		return s.GetSandbox(tenantID, sb.ID)
+	}
+	return nil, apperr.ConflictErr("sandbox must be running, current state is %s", sb.State)
+}
+
+// touchActivity records user activity for idle-timeout reclamation.
+// Persisted at most once per sandbox per minute: fresh enough for the
+// sweeper, without an fsync on every tool call.
+func (s *Service) touchActivity(tenantID, sandboxID string) {
+	now := time.Now().UTC()
+	s.activityMu.Lock()
+	if last, seen := s.activitySeen[sandboxID]; seen && now.Sub(last) < time.Minute {
+		s.activityMu.Unlock()
+		return
+	}
+	s.activitySeen[sandboxID] = now
+	s.activityMu.Unlock()
+	_, _ = s.St.UpdateSandbox(sandboxID, -1, func(x *domain.Sandbox) error {
+		x.LastActivityAt = now
+		return nil
+	})
+}
+
 // transition drives one state transition with the backend call in between:
 // record → pausing → backend.Pause → paused. Intermediate failures revert
 // the record when the backend says the sandbox is still healthy, else leave
@@ -75,7 +111,13 @@ func (s *Service) PauseSandbox(ctx context.Context, tenantID, keyID, sandboxID s
 		return nil, apperr.ConflictErr("pause requires a running sandbox, current state is %s", sb.State)
 	}
 	return s.transition(ctx, sb, domain.StatePausing, domain.StatePaused,
-		func() error { return s.Backend.Pause(ctx, sb.Backend.Ref) },
+		func() error {
+			opts := runtime.PauseOptions{}
+			if s.Cfg.PauseReclaim {
+				opts.MemoryBytes = int64(sb.Spec.MemoryMiB) << 20
+			}
+			return s.Backend.Pause(ctx, sb.Backend.Ref, opts)
+		},
 		domain.ActSandboxPause, keyID)
 }
 
@@ -88,7 +130,13 @@ func (s *Service) ResumeSandbox(ctx context.Context, tenantID, keyID, sandboxID 
 		return nil, apperr.ConflictErr("resume requires a paused sandbox, current state is %s", sb.State)
 	}
 	return s.transition(ctx, sb, domain.StateResuming, domain.StateRunning,
-		func() error { return s.Backend.Resume(ctx, sb.Backend.Ref) },
+		func() error {
+			opts := runtime.PauseOptions{}
+			if s.Cfg.PauseReclaim {
+				opts.MemoryBytes = int64(sb.Spec.MemoryMiB) << 20
+			}
+			return s.Backend.Resume(ctx, sb.Backend.Ref, opts)
+		},
 		domain.ActSandboxResume, keyID)
 }
 
@@ -174,9 +222,10 @@ func (s *Service) Exec(ctx context.Context, tenantID, keyID, sandboxID string, r
 	if err != nil {
 		return nil, err
 	}
-	if sb.State != domain.StateRunning {
-		return nil, apperr.ConflictErr("exec requires a running sandbox, current state is %s", sb.State)
+	if sb, err = s.requireRunning(ctx, tenantID, keyID, sb); err != nil {
+		return nil, err
 	}
+	s.touchActivity(tenantID, sb.ID)
 	if req.Timeout > s.Cfg.MaxExecTimeout {
 		return nil, apperr.Invalid("exec timeout exceeds the platform maximum of %s", s.Cfg.MaxExecTimeout)
 	}
@@ -193,9 +242,10 @@ func (s *Service) PutFile(ctx context.Context, tenantID, keyID, sandboxID, path 
 	if err != nil {
 		return err
 	}
-	if sb.State != domain.StateRunning {
-		return apperr.ConflictErr("file operations require a running sandbox, current state is %s", sb.State)
+	if sb, err = s.requireRunning(ctx, tenantID, keyID, sb); err != nil {
+		return err
 	}
+	s.touchActivity(tenantID, sb.ID)
 	if err := validatePath(path); err != nil {
 		return err
 	}
@@ -214,9 +264,10 @@ func (s *Service) GetFile(ctx context.Context, tenantID, keyID, sandboxID, path 
 	if err != nil {
 		return nil, err
 	}
-	if sb.State != domain.StateRunning {
-		return nil, apperr.ConflictErr("file operations require a running sandbox, current state is %s", sb.State)
+	if sb, err = s.requireRunning(ctx, tenantID, keyID, sb); err != nil {
+		return nil, err
 	}
+	s.touchActivity(tenantID, sb.ID)
 	if err := validatePath(path); err != nil {
 		return nil, err
 	}
@@ -232,9 +283,10 @@ func (s *Service) ListFiles(ctx context.Context, tenantID, keyID, sandboxID, pat
 	if err != nil {
 		return nil, err
 	}
-	if sb.State != domain.StateRunning {
-		return nil, apperr.ConflictErr("file operations require a running sandbox, current state is %s", sb.State)
+	if sb, err = s.requireRunning(ctx, tenantID, keyID, sb); err != nil {
+		return nil, err
 	}
+	s.touchActivity(tenantID, sb.ID)
 	if err := validatePath(path); err != nil {
 		return nil, err
 	}
@@ -246,9 +298,10 @@ func (s *Service) DeleteFile(ctx context.Context, tenantID, keyID, sandboxID, pa
 	if err != nil {
 		return err
 	}
-	if sb.State != domain.StateRunning {
-		return apperr.ConflictErr("file operations require a running sandbox, current state is %s", sb.State)
+	if sb, err = s.requireRunning(ctx, tenantID, keyID, sb); err != nil {
+		return err
 	}
+	s.touchActivity(tenantID, sb.ID)
 	if err := validatePath(path); err != nil {
 		return err
 	}

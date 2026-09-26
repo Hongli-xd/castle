@@ -188,3 +188,47 @@ func baseName(p string) string {
 	}
 	return p
 }
+
+// CopyDir grafts the directory tree at srcPath of srcRef onto dstPath of
+// dstRef. Contract: GET archive returns the tree rooted at the source's
+// basename (docker cp semantics), so the tar is PUT at dstPath's parent and
+// the tree lands at dstPath unchanged — same-path grafting. The base is
+// never modified beyond what the graft adds; this is the layer-composition
+// primitive (DSec §5.1 analog) without requiring dockerd modifications.
+func (b *Backend) CopyDir(ctx context.Context, srcRef, srcPath, dstRef, dstPath string) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	if !strings.HasPrefix(srcPath, "/") || !strings.HasPrefix(dstPath, "/") ||
+		strings.Contains(srcPath, "..") || strings.Contains(dstPath, "..") {
+		return apperr.Invalid("CopyDir paths must be absolute and traversal-free")
+	}
+	if baseName(srcPath) != baseName(dstPath) {
+		return apperr.Invalid("CopyDir requires equal basenames (%q vs %q)", baseName(srcPath), baseName(dstPath))
+	}
+	resp, closer, err := b.c.raw(ctx, "GET",
+		"/containers/"+urlQueryEscape(srcRef)+"/archive", map[string]string{"path": srcPath}, nil, nil)
+	if err != nil {
+		return err
+	}
+	var tree []byte
+	tree, readErr := io.ReadAll(io.LimitReader(resp.Body, 8<<30))
+	closer()
+	if readErr != nil {
+		return apperr.Unavailable("copy: read source tree: %v", readErr)
+	}
+	if resp.StatusCode >= 400 {
+		return statusErr(resp.StatusCode, "copy: source archive", tree)
+	}
+	put, putCloser, err := b.c.raw(ctx, "PUT",
+		"/containers/"+urlQueryEscape(dstRef)+"/archive", map[string]string{"path": parentDir(dstPath)},
+		bytes.NewReader(tree), map[string]string{"Content-Type": "application/x-tar"})
+	if err != nil {
+		return err
+	}
+	defer putCloser()
+	if put.StatusCode >= 400 {
+		body, _ := io.ReadAll(io.LimitReader(put.Body, respLimit))
+		return statusErr(put.StatusCode, "copy: graft into target", body)
+	}
+	return nil
+}

@@ -84,9 +84,13 @@ func (f *fakeBackendForAPI) Create(ctx context.Context, req runtime.CreateReques
 	f.n++
 	return fmt.Sprintf("fake-%d", f.n), nil
 }
-func (f *fakeBackendForAPI) Start(ctx context.Context, ref string) error            { return nil }
-func (f *fakeBackendForAPI) Pause(ctx context.Context, ref string) error            { return nil }
-func (f *fakeBackendForAPI) Resume(ctx context.Context, ref string) error           { return nil }
+func (f *fakeBackendForAPI) Start(ctx context.Context, ref string) error { return nil }
+func (f *fakeBackendForAPI) Pause(ctx context.Context, ref string, opts runtime.PauseOptions) error {
+	return nil
+}
+func (f *fakeBackendForAPI) Resume(ctx context.Context, ref string, opts runtime.PauseOptions) error {
+	return nil
+}
 func (f *fakeBackendForAPI) Stop(ctx context.Context, ref string, force bool) error { return nil }
 func (f *fakeBackendForAPI) Remove(ctx context.Context, ref string) error           { return nil }
 func (f *fakeBackendForAPI) Rename(ctx context.Context, ref, newName string) error  { return nil }
@@ -106,6 +110,9 @@ func (f *fakeBackendForAPI) ListDir(ctx context.Context, ref, path string) ([]ru
 	return nil, nil
 }
 func (f *fakeBackendForAPI) DeletePath(ctx context.Context, ref, path string) error { return nil }
+func (f *fakeBackendForAPI) CopyDir(ctx context.Context, srcRef, srcPath, dstRef, dstPath string) error {
+	return nil
+}
 func (f *fakeBackendForAPI) Commit(ctx context.Context, ref, tag string) (string, int64, error) {
 	return tag, 1, nil
 }

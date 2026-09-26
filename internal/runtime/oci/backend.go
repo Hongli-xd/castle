@@ -66,8 +66,15 @@ type resources struct {
 }
 
 type inspectBody struct {
-	ID    string `json:"Id"`
-	Name  string `json:"Name"`
+	ID     string `json:"Id"`
+	Name   string `json:"Name"`
+	Config struct {
+		Labels map[string]string `json:"Labels"`
+	} `json:"Config"`
+	HostConfig struct {
+		Memory     int64 `json:"Memory"`
+		MemorySwap int64 `json:"MemorySwap"`
+	} `json:"HostConfig"`
 	State struct {
 		Status     string `json:"Status"` // created|running|paused|restarting|removing|exited|dead
 		Running    bool   `json:"Running"`
@@ -78,7 +85,6 @@ type inspectBody struct {
 		FinishedAt string `json:"FinishedAt"`
 		Error      string `json:"Error"`
 	} `json:"State"`
-	Labels map[string]string `json:"Config.Labels"`
 }
 
 func (i *inspectBody) toStatus() runtime.Status {
@@ -199,7 +205,12 @@ func (b *Backend) Start(ctx context.Context, ref string) error {
 	}
 }
 
-func (b *Backend) Pause(ctx context.Context, ref string) error {
+// reclaimTempLimit caps the temporary memory limit used during pause:
+// frozen workloads cannot allocate, so the kernel safely evicts file pages
+// and swaps anonymous pages down toward this ceiling.
+const reclaimTempLimit = 64 << 20
+
+func (b *Backend) Pause(ctx context.Context, ref string, opts runtime.PauseOptions) error {
 	ins, err := b.inspect(ctx, ref)
 	if err != nil {
 		return err
@@ -210,17 +221,60 @@ func (b *Backend) Pause(ctx context.Context, ref string) error {
 	if !ins.State.Running {
 		return apperr.ConflictErr("cannot pause sandbox in state %q", ins.State.Status)
 	}
-	_, err = b.c.do(ctx, "POST", "/containers/"+urlQueryEscape(ref)+"/pause", nil, nil)
-	return err
+	if _, err := b.c.do(ctx, "POST", "/containers/"+urlQueryEscape(ref)+"/pause", nil, nil); err != nil {
+		return err
+	}
+	// Best-effort reclamation while frozen (DSec §6.3): lower the memory
+	// limit so the kernel evicts file pages and swaps anonymous pages.
+	// Failures are non-fatal — the freeze itself is the containment; deep
+	// reclaim resumes on the next host memory pressure either way.
+	if opts.MemoryBytes > 0 {
+		tmp := opts.MemoryBytes
+		if tmp > reclaimTempLimit {
+			tmp = reclaimTempLimit
+		}
+		payload, _ := json.Marshal(resources{
+			Memory:     tmp,
+			MemorySwap: tmp, // swap allowed up to the same ceiling for anon pages
+		})
+		if _, err := b.c.do(ctx, "POST", "/containers/"+urlQueryEscape(ref)+"/update", nil, bytes.NewReader(payload)); err != nil {
+			_ = err // reclaim is opportunistic; the original limit is restored on Resume
+		}
+	}
+	return nil
 }
 
-func (b *Backend) Resume(ctx context.Context, ref string) error {
+func (b *Backend) Resume(ctx context.Context, ref string, opts runtime.PauseOptions) error {
 	ins, err := b.inspect(ctx, ref)
 	if err != nil {
 		return err
 	}
 	if !ins.State.Paused {
 		return nil
+	}
+	// The original limit MUST be restored before unfreezing, or the first
+	// allocations after resume hit the temporary ceiling and OOM. Restore
+	// failures are retried; if they persist, the sandbox is left frozen
+	// and the error surfaces — an unpaused OOM loop is worse.
+	if opts.MemoryBytes > 0 {
+		payload, _ := json.Marshal(resources{
+			Memory:     opts.MemoryBytes,
+			MemorySwap: opts.MemoryBytes,
+		})
+		var lastErr error
+		for attempt := 0; attempt < 5; attempt++ {
+			if _, lastErr = b.c.do(ctx, "POST", "/containers/"+urlQueryEscape(ref)+"/update", nil, bytes.NewReader(payload)); lastErr == nil {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return apperr.From(ctx.Err())
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
+		if lastErr != nil {
+			return apperr.Unavailable("resume: could not restore the original memory limit (sandbox left paused): %v", lastErr)
+		}
 	}
 	_, err = b.c.do(ctx, "POST", "/containers/"+urlQueryEscape(ref)+"/unpause", nil, nil)
 	return err
@@ -337,7 +391,7 @@ func (b *Backend) Exec(ctx context.Context, ref string, req runtime.ExecRequest)
 		if ae, ok := asAppErr(err); ok && ae.Code == apperr.Conflict &&
 			(strings.Contains(ae.Message, "setns") || strings.Contains(ae.Message, "unable to start container process")) {
 			return nil, apperr.ConflictErr(
-				"sandbox process table is exhausted (fork bomb or process leak); "+
+				"sandbox process table is exhausted (fork bomb or process leak); " +
 					"it recovers when its processes exit, or stop/delete and recreate the sandbox",
 			)
 		}
@@ -364,7 +418,7 @@ func (b *Backend) Exec(ctx context.Context, ref string, req runtime.ExecRequest)
 		if res.ExitCode == 128 && strings.Contains(combined, "OCI runtime exec failed") {
 			if strings.Contains(combined, "setns") || strings.Contains(combined, "unable to start container process") {
 				execErr = apperr.ConflictErr(
-					"sandbox process table is exhausted (fork bomb or process leak); "+
+					"sandbox process table is exhausted (fork bomb or process leak); " +
 						"it recovers when its processes exit, or stop/delete and recreate the sandbox",
 				)
 			} else {

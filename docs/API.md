@@ -46,6 +46,7 @@ Base URL：`http(s)://<host>:<port>/v1`。认证：`Authorization: Bearer sk_...
     "cpu_millicores": 500,        // 100..limits.max_cpu_millicores
     "memory_mib": 256,            // 64..limits.max_memory_mib
     "timeout_seconds": 3600,      // 30..86400；到期自动回收
+    "idle_timeout_seconds": 0,    // 0=继承平台默认；≥60：按最后活动回收
     "env": {"K": "V"},            // 键名 ^[A-Za-z_][A-Za-z0-9_]*$，≤50 项
     "user": "1000",               // 可选
     "workdir": "/root",           // 可选，绝对路径
@@ -56,6 +57,14 @@ Base URL：`http(s)://<host>:<port>/v1`。认证：`Authorization: Bearer sk_...
 ```
 
 `201` 返回沙箱记录（含 `id`/`state`/`expires_at`/`backend.ref`）。
+对 **paused** 沙箱的 exec/文件请求默认**自动先恢复再执行**（`auto_resume`，可配）。
+
+**快照打包**：`pack: {"cleanup": ["/tmp/build", ...]}`（≤16 条绝对路径，拒绝系统根目录）
+在提交前删除构建残留，防止参考答案/凭据进入可复用环境；快照记录带 `packed` 标记。
+
+**分层模板**：`POST /v1/templates/compose`（admin）
+`{name, base: tpl_|image, layers: [{image, path}...], public, default_spec}` ——
+各层镜像按路径同位嫁接，独立版本化，组合链记录在 `Template.Composition`。
 磁盘配额（`disk_mib`）在容器后端无法强制——请求该字段将被 501 拒绝，
 除非运维显式 `enforce_disk_quota=false`（文档化的接受风险）。
 

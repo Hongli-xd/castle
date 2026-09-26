@@ -166,6 +166,24 @@ CVE-2026-25253）+ **持有租户 Key 的调用方**。
 5. 负载：50 并发创建/exec 混合负载，P99 与错误率达标（0 5xx、限流器工作正常）。
 6. Agent 实战：pi 扩展端到端——pi 的 bash/read/write 工具实际落在沙箱内执行。
 
+## 7.5 v1.1 路线图（吸收 DSec，arXiv:2609.22978）
+
+DSec（DeepSeek 生产沙盒平台，日产 ~300 万沙箱）验证了本设计的状态单一真相源、
+预热池、Backend 分级与诚实安全语义，并提供如下演进地图：
+
+已落地（v1.1）：透明恢复（auto_resume）、pause 内存回收、空闲超时、
+分层模板组合（base+toolkit 同位嫁接）、pack 防泄漏打包。
+
+中期（需新基础设施）：
+- eBPF 按沙箱网络白名单（按域名/端口/协议过滤，动态更新）——容器后端的
+  egress allowlist 从"诚实拒绝"升级为内核级强制；macOS 开发环境保持拒绝；
+- AppArmor 文件/套接字控制（约束沙箱内 root 对平台日志/内部套接字的访问），
+  攻防样本（XFS_IOC_SWAPEXT 绕过）纳入威胁模型演练。
+
+远期（多节点/训练基础设施规模时）：EROFS+分布式 FS 按需镜像、virtio-pmem DAX
+页缓存共享、DAMON+气球页回收、power-of-k 放置与边缘准入、BGP/ECMP 服务发现、
+GPU FnCall（MIG 分区 + 常驻进程池）。
+
 ## 8. 里程碑映射（本次交付）
 
 M1 地基(apperr/id/domain/store) → M2 runtime(OCI+离线rootfs) → M3 治理(认证/配额/限流/

@@ -8,13 +8,31 @@ import (
 	"sandcastle.dev/sandcastle/internal/domain"
 )
 
+// PackPolicy is the anti-leak packing workflow (DSec §6.1): before the
+// commit, cleanup paths are deleted from the sandbox so build-time
+// residue — cached answers, credentials, scratch state — cannot ride
+// inside a reusable environment.
+type PackPolicy struct {
+	// Cleanup lists absolute in-sandbox paths removed before committing.
+	Cleanup []string `json:"cleanup"`
+}
+
 // CreateSnapshot freezes a sandbox's writable filesystem into a restorable
 // image. Quota is checked against the real committed size; a rejected
 // snapshot deletes its image — nothing lingers that the caller was told no.
-func (s *Service) CreateSnapshot(ctx context.Context, tenantID, keyID, sandboxID, name string) (*domain.Snapshot, error) {
+func (s *Service) CreateSnapshot(ctx context.Context, tenantID, keyID, sandboxID, name string, pack *PackPolicy) (*domain.Snapshot, error) {
 	sb, err := s.loadOwned(tenantID, sandboxID)
 	if err != nil {
 		return nil, err
+	}
+	if pack != nil {
+		// cleanup runs via exec: a paused sandbox is transparently resumed
+		if sb, err = s.requireRunning(ctx, tenantID, keyID, sb); err != nil {
+			return nil, err
+		}
+		if err := s.applyPackCleanup(ctx, tenantID, keyID, sb, pack); err != nil {
+			return nil, err
+		}
 	}
 	switch sb.State {
 	case domain.StateRunning, domain.StatePaused:
@@ -53,11 +71,17 @@ func (s *Service) CreateSnapshot(ctx context.Context, tenantID, keyID, sandboxID
 	sn.ImageRef = imageRef
 	sn.SizeBytes = size
 	sn.Spec = sb.Spec
+	sn.Packed = pack != nil
 	if err := s.St.PutSnapshot(sn); err != nil {
 		_ = s.Backend.RemoveImage(ctx, imageRef)
 		return nil, err
 	}
-	_ = s.Audit.Record(tenantID, sb.ID, keyID, domain.ActSnapshotCreate, map[string]string{"snapshot": sn.ID, "bytes": itoa(int(size))})
+	detail := map[string]string{"snapshot": sn.ID, "bytes": itoa(int(size))}
+	if pack != nil {
+		detail["cleanup_paths"] = itoa(len(pack.Cleanup))
+		_ = s.Audit.Record(tenantID, sb.ID, keyID, domain.ActSnapshotPack, detail)
+	}
+	_ = s.Audit.Record(tenantID, sb.ID, keyID, domain.ActSnapshotCreate, detail)
 	s.Reg.Counter("sandboxd_snapshots_total", "snapshots created", nil, 1)
 	return sn, nil
 }
@@ -138,6 +162,22 @@ func (s *Service) DeleteTemplate(ctx context.Context, tenantID, keyID, templateI
 		return err
 	}
 	_ = s.Audit.Record(tenantID, "", keyID, domain.ActTemplateDelete, map[string]string{"template": tpl.ID})
+	return nil
+}
+
+// applyPackCleanup removes the declared residue paths inside the sandbox
+// before packing. System roots are refused: cleanup is for build residue,
+// not for sabotaging the environment being packed.
+func (s *Service) applyPackCleanup(ctx context.Context, tenantID, keyID string, sb *domain.Sandbox, pack *PackPolicy) error {
+	if err := validateCleanupPaths(pack.Cleanup); err != nil {
+		return err
+	}
+	for _, p := range pack.Cleanup {
+		if err := s.Backend.DeletePath(ctx, sb.Backend.Ref, p); err != nil {
+			return apperr.ConflictErr("pack cleanup %s: %v", p, err)
+		}
+	}
+	_ = s.Audit.Record(tenantID, sb.ID, keyID, domain.ActFileDelete, map[string]string{"pack_cleanup": itoa(len(pack.Cleanup))})
 	return nil
 }
 

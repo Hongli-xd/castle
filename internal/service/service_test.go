@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,16 +21,25 @@ import (
 // tested without Docker. It also simulates failures to exercise the
 // compensation paths (create fails, start fails, external stop, vanish).
 type fakeObj struct {
-	status runtime.Status
-	labels map[string]string
-	files  map[string][]byte
-	dirs   map[string]bool
+	status         runtime.Status
+	labels         map[string]string
+	files          map[string][]byte
+	dirs           map[string]bool
+	reclaimedLimit int64 // nonzero while pause-time reclaim is emulated
+	originalLimit  int64
+}
+
+// fakeImage captures a committed filesystem so restore-from-snapshot is
+// meaningful (a real commit carries the writable layer into the image).
+type fakeImage struct {
+	files map[string][]byte
+	dirs  map[string]bool
 }
 
 type fakeBackend struct {
 	mu      sync.Mutex
 	objects map[string]*fakeObj
-	images  map[string]int64
+	images  map[string]*fakeImage
 	seq     int
 
 	failCreate error
@@ -39,7 +49,7 @@ type fakeBackend struct {
 func newFakeBackend() *fakeBackend {
 	return &fakeBackend{
 		objects: map[string]*fakeObj{},
-		images:  map[string]int64{"base:ok": 123},
+		images:  map[string]*fakeImage{"base:ok": {files: map[string][]byte{}, dirs: map[string]bool{}}},
 	}
 }
 
@@ -56,7 +66,17 @@ func (f *fakeBackend) Create(ctx context.Context, req runtime.CreateRequest) (st
 	}
 	f.seq++
 	ref := fmt.Sprintf("sandboxd-%s-%d", trimSBX(req.Name), f.seq)
-	f.objects[ref] = &fakeObj{labels: req.Labels, files: map[string][]byte{}, dirs: map[string]bool{}}
+	o := &fakeObj{labels: req.Labels, files: map[string][]byte{}, dirs: map[string]bool{}}
+	// restoring from a committed image carries its filesystem in
+	if img, ok := f.images[req.Image]; ok {
+		for p, c := range img.files {
+			o.files[p] = c
+		}
+		for d := range img.dirs {
+			o.dirs[d] = true
+		}
+	}
+	f.objects[ref] = o
 	return ref, nil
 }
 
@@ -81,7 +101,7 @@ func (f *fakeBackend) Start(ctx context.Context, ref string) error {
 	return nil
 }
 
-func (f *fakeBackend) Pause(ctx context.Context, ref string) error {
+func (f *fakeBackend) Pause(ctx context.Context, ref string, opts runtime.PauseOptions) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	o, ok := f.objects[ref]
@@ -90,18 +110,49 @@ func (f *fakeBackend) Pause(ctx context.Context, ref string) error {
 	}
 	o.status.Paused = true
 	o.status.Raw = "paused"
+	o.reclaimedLimit = 0
+	if opts.MemoryBytes > 0 {
+		o.reclaimedLimit = 64 << 20 // emulation of the temporary reclaim ceiling
+		if o.originalLimit == 0 {
+			o.originalLimit = opts.MemoryBytes
+		}
+	}
 	return nil
 }
 
-func (f *fakeBackend) Resume(ctx context.Context, ref string) error {
+func (f *fakeBackend) Resume(ctx context.Context, ref string, opts runtime.PauseOptions) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	o, ok := f.objects[ref]
 	if !ok {
 		return apperr.NotFoundErr("container")
 	}
+	if opts.MemoryBytes > 0 && o.reclaimedLimit != 0 && o.originalLimit != opts.MemoryBytes {
+		return apperr.Unavailable("simulated: original limit restore mismatch")
+	}
+	o.reclaimedLimit = 0
 	o.status.Paused = false
 	o.status.Raw = "running"
+	return nil
+}
+
+func (f *fakeBackend) CopyDir(ctx context.Context, srcRef, srcPath, dstRef, dstPath string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	src, ok := f.objects[srcRef]
+	if !ok {
+		return apperr.NotFoundErr("source container")
+	}
+	dst, ok := f.objects[dstRef]
+	if !ok {
+		return apperr.NotFoundErr("target container")
+	}
+	prefix := strings.TrimSuffix(srcPath, "/") + "/"
+	for p, content := range src.files {
+		if strings.HasPrefix(p, prefix) {
+			dst.files[dstPath+strings.TrimPrefix(p, srcPath)] = content
+		}
+	}
 	return nil
 }
 
@@ -227,10 +278,19 @@ func (f *fakeBackend) DeletePath(ctx context.Context, ref, path string) error {
 func (f *fakeBackend) Commit(ctx context.Context, ref, tag string) (string, int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if _, ok := f.objects[ref]; !ok {
+	o, ok := f.objects[ref]
+	if !ok {
 		return "", 0, apperr.NotFoundErr("container")
 	}
-	f.images[tag] = 4096
+	files := make(map[string][]byte, len(o.files))
+	for p, c := range o.files {
+		files[p] = c
+	}
+	dirs := make(map[string]bool, len(o.dirs))
+	for d := range o.dirs {
+		dirs[d] = true
+	}
+	f.images[tag] = &fakeImage{files: files, dirs: dirs}
 	return tag, 4096, nil
 }
 
@@ -251,7 +311,7 @@ func (f *fakeBackend) RemoveImage(ctx context.Context, imageRef string) error {
 func (f *fakeBackend) ImportRootfs(ctx context.Context, dir, tag string) (string, int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.images[tag] = 2048
+	f.images[tag] = &fakeImage{files: map[string][]byte{}, dirs: map[string]bool{}}
 	return tag, 2048, nil
 }
 
@@ -463,22 +523,158 @@ func TestPauseResumeLifecycle(t *testing.T) {
 }
 
 func TestExecRequiresRunning(t *testing.T) {
+	// auto_resume ON (default): a request to a paused sandbox transparently
+	// resumes it and proceeds — the caller never sees the pause (DSec §6.3)
 	h := newHarness(t)
 	sb := h.create(t, true)
 	if _, err := h.svc.PauseSandbox(context.Background(), h.tn.ID, h.key.ID, sb.ID); err != nil {
 		t.Fatal(err)
 	}
-	_, err := h.svc.Exec(context.Background(), h.tn.ID, h.key.ID, sb.ID, runtime.ExecRequest{Argv: []string{"ls"}})
-	if apperr.From(err).Code != apperr.Conflict {
-		t.Fatalf("exec on paused must conflict, got %v", err)
+	if _, err := h.svc.Exec(context.Background(), h.tn.ID, h.key.ID, sb.ID, runtime.ExecRequest{Argv: []string{"ls"}}); err != nil {
+		t.Fatalf("transparent resume failed: %v", err)
 	}
-	res, err := h.svc.ResumeSandbox(context.Background(), h.tn.ID, h.key.ID, sb.ID)
+	got, _ := h.st.GetSandbox(sb.ID)
+	if got.State != domain.StateRunning {
+		t.Fatalf("sandbox not running after transparent resume: %s", got.State)
+	}
+
+	// auto_resume OFF: paused stays a hard 409
+	h2 := newHarness(t)
+	h2.svc.Cfg.AutoResume = false
+	sb2 := h2.create(t, true)
+	if _, err := h2.svc.PauseSandbox(context.Background(), h2.tn.ID, h2.key.ID, sb2.ID); err != nil {
+		t.Fatal(err)
+	}
+	_, err := h2.svc.Exec(context.Background(), h2.tn.ID, h2.key.ID, sb2.ID, runtime.ExecRequest{Argv: []string{"ls"}})
+	if apperr.From(err).Code != apperr.Conflict {
+		t.Fatalf("auto_resume=false must keep the 409, got %v", err)
+	}
+	if _, err := h2.svc.ResumeSandbox(context.Background(), h2.tn.ID, h2.key.ID, sb2.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h2.svc.Exec(context.Background(), h2.tn.ID, h2.key.ID, sb2.ID, runtime.ExecRequest{Argv: []string{"ls"}}); err != nil {
+		t.Fatalf("exec on running: %v", err)
+	}
+}
+
+func TestPauseReclaimsMemoryAndRestores(t *testing.T) {
+	h := newHarness(t)
+	sb := h.create(t, true)
+	if _, err := h.svc.PauseSandbox(context.Background(), h.tn.ID, h.key.ID, sb.ID); err != nil {
+		t.Fatal(err)
+	}
+	fbObj := h.fb.objects[sb.Backend.Ref]
+	if fbObj.reclaimedLimit == 0 {
+		t.Fatal("pause did not apply the reclaim ceiling")
+	}
+	if _, err := h.svc.ResumeSandbox(context.Background(), h.tn.ID, h.key.ID, sb.ID); err != nil {
+		t.Fatal(err)
+	}
+	if h.fb.objects[sb.Backend.Ref].reclaimedLimit != 0 {
+		t.Fatal("resume did not restore the original memory limit")
+	}
+}
+
+func TestIdleSweeperExpires(t *testing.T) {
+	h := newHarness(t)
+	sb := h.create(t, true)
+	if _, err := h.st.UpdateSandbox(sb.ID, sb.Version, func(x *domain.Sandbox) error {
+		x.Spec.IdleTimeoutSeconds = 60
+		x.LastActivityAt = time.Now().UTC().Add(-2 * time.Minute)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// hard TTL not reached — only the idle timeout fires
+	h.svc.sweepExpired()
+	got, _ := h.st.GetSandbox(sb.ID)
+	if got.State != domain.StateStopped {
+		t.Fatalf("idle sandbox not stopped: %s", got.State)
+	}
+	evs := h.st.ListEvents(store.EventQuery{TenantID: h.tn.ID, Action: domain.ActSandboxIdleExpire})
+	if len(evs) != 1 {
+		t.Fatalf("idle expiry not audited: %d", len(evs))
+	}
+	// fresh activity must protect the sandbox
+	sb2 := h.create(t, true)
+	if _, err := h.st.UpdateSandbox(sb2.ID, sb2.Version, func(x *domain.Sandbox) error {
+		x.Spec.IdleTimeoutSeconds = 60
+		x.LastActivityAt = time.Now().UTC().Add(-2 * time.Minute)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.st.UpdateSandbox(sb2.ID, -1, func(x *domain.Sandbox) error {
+		x.LastActivityAt = time.Now().UTC() // activity refresh
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.svc.sweepExpired()
+	if got2, _ := h.st.GetSandbox(sb2.ID); got2.State != domain.StateRunning {
+		t.Fatalf("freshly-active sandbox was idle-expired: %s", got2.State)
+	}
+}
+
+func TestPackCleanupRemovesResidue(t *testing.T) {
+	h := newHarness(t)
+	sb := h.create(t, true)
+	ctx := context.Background()
+	if err := h.svc.PutFile(ctx, h.tn.ID, h.key.ID, sb.ID, "/tmp/build/answer.key", []byte("leak"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.svc.PutFile(ctx, h.tn.ID, h.key.ID, sb.ID, "/tmp/build/keep.txt", []byte("keep"), 0); err != nil {
+		t.Fatal(err)
+	}
+	sn, err := h.svc.CreateSnapshot(ctx, h.tn.ID, h.key.ID, sb.ID, "packed", &PackPolicy{Cleanup: []string{"/tmp/build/answer.key"}})
+	if err != nil {
+		t.Fatalf("packed snapshot: %v", err)
+	}
+	if !sn.Packed {
+		t.Fatal("snapshot not marked packed")
+	}
+	if _, err := h.svc.GetFile(ctx, h.tn.ID, h.key.ID, sb.ID, "/tmp/build/answer.key"); err == nil {
+		t.Fatal("cleanup path survived packing")
+	}
+	if _, err := h.svc.GetFile(ctx, h.tn.ID, h.key.ID, sb.ID, "/tmp/build/keep.txt"); err != nil {
+		t.Fatalf("cleanup deleted a non-listed file: %v", err)
+	}
+	// system roots are refused before any deletion happens
+	if _, err := h.svc.CreateSnapshot(ctx, h.tn.ID, h.key.ID, sb.ID, "evil-pack", &PackPolicy{Cleanup: []string{"/usr"}}); err == nil {
+		t.Fatal("pack cleanup accepted a system path")
+	}
+}
+
+func TestComposeTemplateGraftsLayers(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	// a "toolkit image": a snapshot from a seeded sandbox serves as one
+	base := h.create(t, true)
+	if err := h.svc.PutFile(ctx, h.tn.ID, h.key.ID, base.ID, "/opt/toolkit/entry.sh", []byte("toolkit"), 0); err != nil {
+		t.Fatal(err)
+	}
+	layerSnap, err := h.svc.CreateSnapshot(ctx, h.tn.ID, h.key.ID, base.ID, "toolkit-layer", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = res
-	if _, err := h.svc.Exec(context.Background(), h.tn.ID, h.key.ID, sb.ID, runtime.ExecRequest{Argv: []string{"ls"}}); err != nil {
-		t.Fatalf("exec on running: %v", err)
+	tpl, err := h.svc.ComposeTemplate(ctx, h.key.ID, "composed", "base:ok",
+		[]ComposeLayer{{Image: layerSnap.ImageRef, Path: "/opt/toolkit"}},
+		domain.SandboxSpec{CPUMillicores: 500, MemoryMiB: 256, TimeoutSeconds: 600}, true)
+	if err != nil {
+		t.Fatalf("compose: %v", err)
+	}
+	if len(tpl.Composition) != 2 {
+		t.Fatalf("composition chain not recorded: %+v", tpl.Composition)
+	}
+	sb, err := h.svc.CreateSandbox(ctx, h.tn, h.key, CreateRequest{
+		TemplateID: tpl.ID, Wait: true, WaitTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("create from composed template: %v", err)
+	}
+	got, err := h.svc.GetFile(ctx, h.tn.ID, h.key.ID, sb.ID, "/opt/toolkit/entry.sh")
+	if err != nil || string(got) != "toolkit" {
+		t.Fatalf("grafted layer content missing in sandbox: %v %q", err, got)
 	}
 }
 
@@ -530,7 +726,7 @@ func TestSnapshotCreateAndRestore(t *testing.T) {
 	if err := h.svc.PutFile(ctx, h.tn.ID, h.key.ID, sb.ID, "/root/state.txt", []byte("v1"), 0); err != nil {
 		t.Fatal(err)
 	}
-	sn, err := h.svc.CreateSnapshot(ctx, h.tn.ID, h.key.ID, sb.ID, "checkpoint-1")
+	sn, err := h.svc.CreateSnapshot(ctx, h.tn.ID, h.key.ID, sb.ID, "checkpoint-1", nil)
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
@@ -566,7 +762,7 @@ func TestSnapshotQuotaRollsBackImage(t *testing.T) {
 		return nil
 	})
 	sb := h.create(t, true)
-	_, err := h.svc.CreateSnapshot(context.Background(), h.tn.ID, h.key.ID, sb.ID, "big")
+	_, err := h.svc.CreateSnapshot(context.Background(), h.tn.ID, h.key.ID, sb.ID, "big", nil)
 	if apperr.From(err).Code != apperr.QuotaExceeded {
 		t.Fatalf("want quota_exceeded, got %v", err)
 	}

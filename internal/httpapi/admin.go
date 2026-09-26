@@ -6,6 +6,7 @@ import (
 
 	"sandcastle.dev/sandcastle/internal/apperr"
 	"sandcastle.dev/sandcastle/internal/domain"
+	"sandcastle.dev/sandcastle/internal/service"
 )
 
 // Admin endpoints require ScopeAdmin keys. Tenant scoping on key responses:
@@ -203,6 +204,33 @@ func (s *Server) importTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tpl, err := s.Svc.ImportRootfsTemplate(r.Context(), key.ID, body.Name, body.RootfsDir, body.Public, body.DefaultSpec)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, tpl)
+}
+
+// composeTemplate materializes a layered template from a base environment
+// plus toolkit-layer images (DSec §5.1 environment composition).
+func (s *Server) composeTemplate(w http.ResponseWriter, r *http.Request) {
+	key := keyFrom(r)
+	if err := adminOnly(key); err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	var body struct {
+		Name        string                 `json:"name"`
+		Base        string                 `json:"base"` // tpl_... or image reference
+		Layers      []service.ComposeLayer `json:"layers"`
+		Public      bool                   `json:"public"`
+		DefaultSpec domain.SandboxSpec     `json:"default_spec"`
+	}
+	if err := decode(r, &body); err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	tpl, err := s.Svc.ComposeTemplate(r.Context(), key.ID, body.Name, body.Base, body.Layers, body.DefaultSpec, body.Public)
 	if err != nil {
 		s.writeError(w, r, err)
 		return

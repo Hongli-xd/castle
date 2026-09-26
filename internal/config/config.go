@@ -31,14 +31,23 @@ type Config struct {
 	// Resource ceilings a single spec may request (platform-wide).
 	Limits domain.Limits
 	// Defaults for specs the caller leaves unspecified.
-	DefaultCPUMillicores  int
-	DefaultMemoryMiB      int
-	DefaultTimeoutSeconds int
+	DefaultCPUMillicores      int
+	DefaultMemoryMiB          int
+	DefaultTimeoutSeconds     int
+	DefaultIdleTimeoutSeconds int // 0 = idle reclamation off unless a spec sets it
 
 	// enforce_disk_quota: overlayfs/ext4 cannot enforce per-sandbox disk
 	// caps; when true, creates that request disk_mib are REFUSED unless the
 	// operator sets enforce_disk_quota=false to accept the documented risk.
 	EnforceDiskQuota bool
+
+	// auto_resume: requests to a paused sandbox (exec/files) transparently
+	// resume it first (DSec §6.3 semantics). Default true.
+	AutoResume bool
+	// pause_reclaim: on pause, temporarily lower the container memory limit
+	// so the kernel reclaims file pages and swaps anonymous pages while the
+	// workload is frozen; restored before unpause. Default true.
+	PauseReclaim bool
 
 	Defaults domain.TenantQuota // platform default quotas/rates
 
@@ -81,10 +90,13 @@ func Default() *Config {
 			MaxMetadataKeys:   20,
 			MaxMetadataBytes:  1024,
 		},
-		DefaultCPUMillicores:  1000,
-		DefaultMemoryMiB:      512,
-		DefaultTimeoutSeconds: 3600,
-		EnforceDiskQuota:      true,
+		DefaultCPUMillicores:      1000,
+		DefaultMemoryMiB:          512,
+		DefaultTimeoutSeconds:     3600,
+		DefaultIdleTimeoutSeconds: 0,
+		EnforceDiskQuota:          true,
+		AutoResume:                true,
+		PauseReclaim:              true,
 		Defaults: domain.TenantQuota{
 			MaxSandboxes:     10,
 			MaxCPUMillicores: 8000,
@@ -211,6 +223,12 @@ func (c *Config) set(key, val string) error {
 		return setInt(&c.DefaultMemoryMiB)
 	case "defaults.timeout_seconds":
 		return setInt(&c.DefaultTimeoutSeconds)
+	case "defaults.idle_timeout_seconds":
+		return setInt(&c.DefaultIdleTimeoutSeconds)
+	case "auto_resume":
+		c.AutoResume = val == "true" || val == "1"
+	case "pause_reclaim":
+		c.PauseReclaim = val == "true" || val == "1"
 	case "enforce_disk_quota":
 		c.EnforceDiskQuota = val == "true" || val == "1"
 	case "quota.max_sandboxes":
@@ -271,6 +289,9 @@ func (c *Config) applyEnv() {
 	}
 	if v, ok := env("ENFORCE_DISK_QUOTA"); ok {
 		c.EnforceDiskQuota = v == "true" || v == "1"
+	}
+	if v, ok := env("AUTO_RESUME"); ok {
+		c.AutoResume = v == "true" || v == "1"
 	}
 }
 

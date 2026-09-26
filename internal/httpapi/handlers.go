@@ -382,14 +382,15 @@ func (s *Server) createSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		SandboxID string `json:"sandbox_id"`
-		Name      string `json:"name"`
+		SandboxID string              `json:"sandbox_id"`
+		Name      string              `json:"name"`
+		Pack      *service.PackPolicy `json:"pack,omitempty"`
 	}
 	if err := decode(r, &body); err != nil {
 		s.writeError(w, r, err)
 		return
 	}
-	sn, err := s.Svc.CreateSnapshot(r.Context(), tn.ID, key.ID, body.SandboxID, body.Name)
+	sn, err := s.Svc.CreateSnapshot(r.Context(), tn.ID, key.ID, body.SandboxID, body.Name, body.Pack)
 	if err != nil {
 		s.writeError(w, r, err)
 		return

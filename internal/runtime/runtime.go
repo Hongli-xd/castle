@@ -65,6 +65,13 @@ type ExecResult struct {
 	TimedOut  bool          `json:"timed_out"`
 }
 
+// PauseOptions carries what the backend needs for reclaim-on-pause.
+// MemoryBytes is the sandbox's configured memory cap in bytes; 0 skips
+// reclamation (plain freeze).
+type PauseOptions struct {
+	MemoryBytes int64
+}
+
 // FileInfo describes one directory entry.
 type FileInfo struct {
 	Name  string `json:"name"`
@@ -97,8 +104,13 @@ type Backend interface {
 	// Lifecycle
 	Create(ctx context.Context, req CreateRequest) (ref string, err error)
 	Start(ctx context.Context, ref string) error
-	Pause(ctx context.Context, ref string) error
-	Resume(ctx context.Context, ref string) error
+	// Pause freezes the workload. When opts.MemoryBytes > 0 the backend
+	// additionally performs best-effort proactive reclamation while the
+	// workload is frozen (DSec §6.3): the memory limit is temporarily
+	// lowered so the kernel evicts file pages and swaps anonymous pages;
+	// Resume restores the original limit BEFORE unfreezing.
+	Pause(ctx context.Context, ref string, opts PauseOptions) error
+	Resume(ctx context.Context, ref string, opts PauseOptions) error
 	Stop(ctx context.Context, ref string, force bool) error
 	Remove(ctx context.Context, ref string) error
 	Inspect(ctx context.Context, ref string) (Status, error)
@@ -112,6 +124,11 @@ type Backend interface {
 	GetFile(ctx context.Context, ref, path string, maxSize int64) ([]byte, error)
 	ListDir(ctx context.Context, ref, path string) ([]FileInfo, error)
 	DeletePath(ctx context.Context, ref, path string) error
+	// CopyDir grafts the directory tree at srcPath of srcRef onto dstPath
+	// of dstRef (same-path grafting: the tree keeps its basename). This is
+	// the primitive behind template layer composition (DSec §5.1) — the
+	// base stays untouched, each toolkit layer is grafted on top.
+	CopyDir(ctx context.Context, srcRef, srcPath, dstRef, dstPath string) error
 
 	// Snapshots and images
 	Commit(ctx context.Context, ref, tag string) (imageRef string, sizeBytes int64, err error)

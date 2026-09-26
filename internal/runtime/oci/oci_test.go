@@ -204,7 +204,7 @@ func TestPauseResume(t *testing.T) {
 	ref := mkSandbox(t, b, 128)
 	ctx := context.Background()
 
-	if err := b.Pause(ctx, ref); err != nil {
+	if err := b.Pause(ctx, ref, runtime.PauseOptions{MemoryBytes: 128 << 20}); err != nil {
 		t.Fatalf("pause: %v", err)
 	}
 	st, err := b.Inspect(ctx, ref)
@@ -212,17 +212,25 @@ func TestPauseResume(t *testing.T) {
 		t.Fatalf("inspect after pause: %+v err=%v", st, err)
 	}
 	// idempotent pause by real phase
-	if err := b.Pause(ctx, ref); err != nil {
+	if err := b.Pause(ctx, ref, runtime.PauseOptions{MemoryBytes: 128 << 20}); err != nil {
 		t.Fatalf("double pause should be a no-op: %v", err)
 	}
-	if err := b.Resume(ctx, ref); err != nil {
+	if err := b.Resume(ctx, ref, runtime.PauseOptions{MemoryBytes: 128 << 20}); err != nil {
 		t.Fatalf("resume: %v", err)
 	}
 	st, _ = b.Inspect(ctx, ref)
 	if st.Paused || !st.Running {
 		t.Fatalf("inspect after resume: %+v", st)
 	}
-	if err := b.Resume(ctx, ref); err != nil {
+	// the pause-time reclaim must have restored the original memory limit
+	ins, err := b.inspect(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ins.HostConfig.Memory != 128<<20 || ins.HostConfig.MemorySwap != 128<<20 {
+		t.Fatalf("pause reclaim did not restore limits: mem=%d swap=%d", ins.HostConfig.Memory, ins.HostConfig.MemorySwap)
+	}
+	if err := b.Resume(ctx, ref, runtime.PauseOptions{MemoryBytes: 128 << 20}); err != nil {
 		t.Fatalf("double resume should be a no-op: %v", err)
 	}
 	res, err := b.Exec(ctx, ref, runtime.ExecRequest{Argv: []string{"/bin/echo", "alive"}, Timeout: 30 * time.Second})
@@ -507,5 +515,27 @@ func extractTarInto(r io.Reader, dstDir string) error {
 				return err
 			}
 		}
+	}
+}
+
+func TestCopyDirGraftsTree(t *testing.T) {
+	b := needDocker(t)
+	ctx := context.Background()
+	refA := mkSandbox(t, b, 128)
+	refB := mkSandbox(t, b, 128)
+
+	payload := []byte("grafted-toolkit-content")
+	if err := b.PutFile(ctx, refA, runtime.PutFileRequest{Path: "/opt/toolkit/bin/run.sh", Content: payload, Mode: 0o755}); err != nil {
+		t.Fatalf("seed source tree: %v", err)
+	}
+	if err := b.CopyDir(ctx, refA, "/opt/toolkit", refB, "/opt/toolkit"); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	got, err := b.GetFile(ctx, refB, "/opt/toolkit/bin/run.sh", 1<<20)
+	if err != nil {
+		t.Fatalf("grafted file missing: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("grafted content mismatch: %q", got)
 	}
 }

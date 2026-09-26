@@ -126,14 +126,18 @@ func (p EgressPolicy) Validate() error {
 // SandboxSpec is the requested shape of a sandbox. It is validated against
 // platform Limits; tenant quotas are a service-layer concern, not here.
 type SandboxSpec struct {
-	CPUMillicores  int               `json:"cpu_millicores"`
-	MemoryMiB      int               `json:"memory_mib"`
-	DiskMiB        int               `json:"disk_mib,omitempty"`
-	TimeoutSeconds int               `json:"timeout_seconds"`
-	Egress         EgressPolicy      `json:"egress"`
-	Env            map[string]string `json:"env,omitempty"`
-	User           string            `json:"user,omitempty"`
-	WorkDir        string            `json:"workdir,omitempty"`
+	CPUMillicores  int `json:"cpu_millicores"`
+	MemoryMiB      int `json:"memory_mib"`
+	DiskMiB        int `json:"disk_mib,omitempty"`
+	TimeoutSeconds int `json:"timeout_seconds"`
+	// IdleTimeoutSeconds reclaims sandboxes idle for this long (measured
+	// from last user activity), independent of the hard TTL. 0 inherits
+	// the platform default, which may itself be 0 (disabled).
+	IdleTimeoutSeconds int               `json:"idle_timeout_seconds,omitempty"`
+	Egress             EgressPolicy      `json:"egress"`
+	Env                map[string]string `json:"env,omitempty"`
+	User               string            `json:"user,omitempty"`
+	WorkDir            string            `json:"workdir,omitempty"`
 }
 
 // Limits are the platform-wide ceilings a spec is validated against.
@@ -170,6 +174,9 @@ func (s SandboxSpec) Validate(l Limits, minDiskMiB int) error {
 	if s.TimeoutSeconds < 30 || s.TimeoutSeconds > l.MaxTimeoutSeconds {
 		return apperr.Invalid("timeout_seconds must be between 30 and %d", l.MaxTimeoutSeconds)
 	}
+	if s.IdleTimeoutSeconds != 0 && (s.IdleTimeoutSeconds < 60 || s.IdleTimeoutSeconds > l.MaxTimeoutSeconds) {
+		return apperr.Invalid("idle_timeout_seconds must be 0 (inherit) or between 60 and %d", l.MaxTimeoutSeconds)
+	}
 	if len(s.Env) > l.MaxEnvEntries {
 		return apperr.Invalid("env supports at most %d entries", l.MaxEnvEntries)
 	}
@@ -205,21 +212,41 @@ type SandboxBackendRef struct {
 }
 
 type Sandbox struct {
-	ID          string            `json:"id"`
-	TenantID    string            `json:"tenant_id"`
-	TemplateID  string            `json:"template_id,omitempty"`
-	SnapshotID  string            `json:"snapshot_id,omitempty"`
-	BaseImage   string            `json:"base_image,omitempty"`
-	Spec        SandboxSpec       `json:"spec"`
-	State       SandboxState      `json:"state"`
-	Backend     SandboxBackendRef `json:"backend"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
-	Reason      string            `json:"reason,omitempty"` // sanitized failure/explanation
-	CreatedAt   time.Time         `json:"created_at"`
-	UpdatedAt   time.Time         `json:"updated_at"`
-	ExpiresAt   time.Time         `json:"expires_at"`
-	Version     int64             `json:"version"`
-	BaseVersion int64             `json:"base_version"`
+	ID         string            `json:"id"`
+	TenantID   string            `json:"tenant_id"`
+	TemplateID string            `json:"template_id,omitempty"`
+	SnapshotID string            `json:"snapshot_id,omitempty"`
+	BaseImage  string            `json:"base_image,omitempty"`
+	Spec       SandboxSpec       `json:"spec"`
+	State      SandboxState      `json:"state"`
+	Backend    SandboxBackendRef `json:"backend"`
+	Metadata   map[string]string `json:"metadata,omitempty"`
+	Reason     string            `json:"reason,omitempty"` // sanitized failure/explanation
+	CreatedAt  time.Time         `json:"created_at"`
+	UpdatedAt  time.Time         `json:"updated_at"`
+	ExpiresAt  time.Time         `json:"expires_at"`
+	// LastActivityAt drives idle-timeout reclamation; zero means "no
+	// activity recorded since creation" (the sweeper then uses CreatedAt).
+	LastActivityAt time.Time `json:"last_activity_at,omitempty"`
+	Version        int64     `json:"version"`
+	BaseVersion    int64     `json:"base_version"`
+}
+
+// IdleDeadline is the instant when idle reclamation becomes due.
+func (sb *Sandbox) IdleDeadline() time.Time {
+	if sb.LastActivityAt.IsZero() {
+		return sb.CreatedAt.Add(time.Duration(sb.Spec.IdleTimeoutSeconds) * time.Second)
+	}
+	return sb.LastActivityAt.Add(time.Duration(sb.Spec.IdleTimeoutSeconds) * time.Second)
+}
+
+// IdleExpired reports whether the idle timeout has passed at now. A zero
+// IdleTimeoutSeconds disables idle reclamation entirely.
+func (sb *Sandbox) IdleExpired(now time.Time) bool {
+	if sb.Spec.IdleTimeoutSeconds <= 0 {
+		return false
+	}
+	return now.After(sb.IdleDeadline())
 }
 
 func NewSandbox(tenantID string) *Sandbox {

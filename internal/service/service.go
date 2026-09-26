@@ -27,25 +27,28 @@ type Service struct {
 	Cfg     *config.Config
 	Reg     *metrics.Registry
 
-	createSem chan struct{}
-	poolMu    sync.Mutex
-	pool      map[string][]poolItem // imageRef → warm items
-	stopCh    chan struct{}
-	stopOnce  sync.Once
+	createSem    chan struct{}
+	poolMu       sync.Mutex
+	pool         map[string][]poolItem // imageRef → warm items
+	activityMu   sync.Mutex
+	activitySeen map[string]time.Time // sandboxID → last persisted activity flush
+	stopCh       chan struct{}
+	stopOnce     sync.Once
 }
 
 func New(st *store.Store, backend runtime.Backend, cfg *config.Config, reg *metrics.Registry) *Service {
 	s := &Service{
-		St:        st,
-		Backend:   backend,
-		Auth:      gov.NewAuthenticator(st),
-		Quotas:    gov.NewQuotas(st, cfg.Defaults),
-		Limiter:   gov.NewLimiter(),
-		Audit:     gov.NewAudit(st),
-		Cfg:       cfg,
-		Reg:       reg,
-		createSem: make(chan struct{}, cfg.MaxConcurrentCreates),
-		stopCh:    make(chan struct{}),
+		St:           st,
+		Backend:      backend,
+		Auth:         gov.NewAuthenticator(st),
+		Quotas:       gov.NewQuotas(st, cfg.Defaults),
+		Limiter:      gov.NewLimiter(),
+		Audit:        gov.NewAudit(st),
+		Cfg:          cfg,
+		Reg:          reg,
+		createSem:    make(chan struct{}, cfg.MaxConcurrentCreates),
+		activitySeen: map[string]time.Time{},
+		stopCh:       make(chan struct{}),
 	}
 	return s
 }
@@ -221,6 +224,9 @@ func mergeSpec(defaults *domain.SandboxSpec, req domain.SandboxSpec, cfg *config
 	}
 	if out.TimeoutSeconds == 0 {
 		out.TimeoutSeconds = cfg.DefaultTimeoutSeconds
+	}
+	if out.IdleTimeoutSeconds == 0 {
+		out.IdleTimeoutSeconds = cfg.DefaultIdleTimeoutSeconds
 	}
 	if req.CPUMillicores != 0 {
 		out.CPUMillicores = req.CPUMillicores

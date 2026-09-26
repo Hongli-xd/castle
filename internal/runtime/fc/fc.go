@@ -52,9 +52,11 @@ func (b *Backend) Create(ctx context.Context, req runtime.CreateRequest) (string
 	return "", kvmRequired()
 }
 
-func (b *Backend) Start(ctx context.Context, ref string) error  { return kvmRequired() }
-func (b *Backend) Pause(ctx context.Context, ref string) error  { return kvmRequired() }
-func (b *Backend) Resume(ctx context.Context, ref string) error { return kvmRequired() }
+func (b *Backend) Start(ctx context.Context, ref string) error { return kvmRequired() }
+func (b *Backend) Pause(ctx context.Context, ref string) error { return kvmRequired() }
+func (b *Backend) Resume(ctx context.Context, ref string, opts runtime.PauseOptions) error {
+	return kvmRequired()
+}
 func (b *Backend) Stop(ctx context.Context, ref string, force bool) error {
 	return kvmRequired()
 }
@@ -81,6 +83,10 @@ func (b *Backend) ListDir(ctx context.Context, ref, path string) ([]runtime.File
 }
 
 func (b *Backend) DeletePath(ctx context.Context, ref, path string) error { return kvmRequired() }
+
+func (b *Backend) CopyDir(ctx context.Context, srcRef, srcPath, dstRef, dstPath string) error {
+	return kvmRequired()
+}
 
 func (b *Backend) Commit(ctx context.Context, ref, tag string) (string, int64, error) {
 	return "", 0, kvmRequired()

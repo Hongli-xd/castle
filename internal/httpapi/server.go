@@ -85,6 +85,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.Handle("GET /v1/tenants/{id}/keys", s.chain(domain.GroupAdmin, s.listKeys))
 	mux.Handle("DELETE /v1/tenants/{id}/keys/{key_id}", s.chain(domain.GroupAdmin, s.revokeKey))
 	mux.Handle("POST /v1/templates/import", s.chain(domain.GroupAdmin, s.importTemplate))
+	mux.Handle("POST /v1/templates/compose", s.chain(domain.GroupAdmin, s.composeTemplate))
 }
 
 // chain composes the middleware stack. Order is load-bearing: the rate

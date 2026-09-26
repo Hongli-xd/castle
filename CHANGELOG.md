@@ -1,5 +1,33 @@
 # 变更说明
 
+## v1.1.0（2026-09-26）— 吸收 DSec（DeepSeek Elastic Compute, arXiv:2609.22978）设计
+
+对照 DeepSeek 生产沙盒平台论文（支撑 V3.2→V4.1 agentic RL 训练，日产 ~300 万沙箱）
+的五项近期可落地设计，全部实现并补齐回归测试：
+
+1. **透明恢复（auto_resume）**：对 paused 沙箱的 exec/文件请求自动先恢复再执行，
+   调用方不再感知冻结状态（DSec §6.3 "transparently resumes it"）。配置
+   `auto_resume`（默认开）可关闭回到 409 语义。
+2. **pause 时主动内存回收**：暂停后临时下调容器内存上限（≤64MiB）触发内核回收
+   文件页并换出匿名页，恢复前**必须**先还原原始上限（重试至多 5 次，失败则保持
+   冻结并报错——带病解冻的 OOM 循环更糟）（DSec §6.3）。配置 `pause_reclaim`。
+3. **空闲超时**：`spec.idle_timeout_seconds`（≥60s，0 继承平台默认/0=关闭）+
+   `LastActivityAt` 活动时间戳（每沙箱每分钟至多落盘一次），清扫器按
+   `sandbox.idle_expire` 独立审计。DSec §1(3)：agent 交互间隙 CPU 稀疏，
+   内存/页缓存长期驻留是密度上限的主要约束。
+4. **分层模板组合**：`POST /v1/templates/compose` —— base + toolkit 层镜像按路径
+   同位嫁接（container-to-container archive 拷贝），基座与每层独立版本化，
+   组合链记入 `Template.Composition`；组合残留容器由 reconciler 按名回收
+   （DSec §5.1，容器后端实现无需修改 dockerd）。
+5. **pack 防泄漏打包**：`POST /v1/snapshots` 支持 `pack.cleanup`（≤16 条路径，
+   拒绝系统根目录），提交前删除构建残留/参考答案；快照带 `packed` 标记与
+   独立审计事件（DSec §6.1 "build environments of Agents, by Agents, for Agents"
+   的防泄漏语义）。
+
+同时新增 `POST /v1/templates/compose`（admin）端点与 `CopyDir` 后端原语
+（接口 + OCI 实现 + Firecracker 骨架）。
+
+
 ## v1.0.0（2026-09-25）— 首个商用版本
 
 本次交付在本仓库从零构建了完整的 sandboxd 运行时。调研与设计依据见

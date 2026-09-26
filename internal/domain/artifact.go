@@ -17,7 +17,8 @@ type Snapshot struct {
 	Name        string      `json:"name"`
 	ImageRef    string      `json:"image_ref"` // backend artifact handle
 	SizeBytes   int64       `json:"size_bytes"`
-	Spec        SandboxSpec `json:"spec"` // origin spec; defaults when restoring
+	Spec        SandboxSpec `json:"spec"`             // origin spec; defaults when restoring
+	Packed      bool        `json:"packed,omitempty"` // built via the pack workflow (cleanup applied)
 	CreatedAt   time.Time   `json:"created_at"`
 	Version     int64       `json:"version"`
 	BaseVersion int64       `json:"base_version"`
@@ -50,10 +51,15 @@ func (s *Snapshot) Validate() error {
 // Template is a reusable sandbox base: a backend image artifact plus a
 // default spec. Platform templates (TenantID=="") are visible to everyone.
 type Template struct {
-	ID          string      `json:"id"`
-	TenantID    string      `json:"tenant_id"` // "" = platform template
-	Name        string      `json:"name"`
-	ImageRef    string      `json:"image_ref"`
+	ID       string `json:"id"`
+	TenantID string `json:"tenant_id"` // "" = platform template
+	Name     string `json:"name"`
+	ImageRef string `json:"image_ref"`
+	// Composition records the layer images grafted onto the base, in
+	// order (DSec §5.1 layer model, adapted: layers are materialized at
+	// compose time via container-to-container tree grafts, so the base
+	// image and each toolkit image stay independently versioned).
+	Composition []string    `json:"composition,omitempty"`
 	DefaultSpec SandboxSpec `json:"default_spec"`
 	Public      bool        `json:"public"`
 	CreatedAt   time.Time   `json:"created_at"`
