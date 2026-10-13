@@ -31,7 +31,7 @@ import (
 	"sandcastle.dev/sandcastle/internal/store"
 )
 
-var version = "1.1.6"
+var version = "1.1.8"
 
 func logf(level, format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)

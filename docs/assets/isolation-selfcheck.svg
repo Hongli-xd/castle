@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 468" width="920" height="468" role="img" aria-label="启动自检闭环：用生产载荷路径起真沙箱、读内核事实、跑逃逸探针、逐项对照契约，再发布 /readyz 与 /v1/isolation">
+  <defs>
+    <marker id="arw2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L9,4.5 L0,9 z" fill="#57606a"/>
+    </marker>
+  </defs>
+
+  <rect width="920" height="468" fill="#ffffff"/>
+
+  <!-- steps -->
+  <rect x="150" y="16" width="620" height="46" rx="8" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="460" y="44" text-anchor="middle" font-size="12.5" fill="#1f2328" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">① 起一个真沙箱 —— 走与生产完全相同的载荷路径</text>
+  <line x1="460" y1="62" x2="460" y2="76" stroke="#57606a" stroke-width="1.5" marker-end="url(#arw2)"/>
+
+  <rect x="150" y="80" width="620" height="46" rx="8" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="460" y="108" text-anchor="middle" font-size="12.5" fill="#1f2328" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">② 从沙箱内部读内核事实 —— uid_map · seccomp · 能力集 · LSM 标签 · core dump 上限</text>
+  <line x1="460" y1="126" x2="460" y2="140" stroke="#57606a" stroke-width="1.5" marker-end="url(#arw2)"/>
+
+  <rect x="150" y="144" width="620" height="46" rx="8" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="460" y="172" text-anchor="middle" font-size="12.5" fill="#1f2328" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">③ 跑两个逃逸探针 —— mount · 读 /proc/kcore</text>
+  <line x1="460" y1="190" x2="460" y2="204" stroke="#57606a" stroke-width="1.5" marker-end="url(#arw2)"/>
+
+  <rect x="150" y="208" width="620" height="46" rx="8" fill="#fef9c3" stroke="#eab308"/>
+  <text x="460" y="236" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1f2328" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">④ 逐项对照 SECURITY-CONTRACT 的 22 条承诺 —— 全部可核对？</text>
+
+  <!-- branch -->
+  <line x1="460" y1="254" x2="460" y2="284" stroke="#57606a" stroke-width="1.5"/>
+  <line x1="254" y1="284" x2="666" y2="284" stroke="#57606a" stroke-width="1.5"/>
+  <line x1="254" y1="284" x2="254" y2="304" stroke="#57606a" stroke-width="1.5" marker-end="url(#arw2)"/>
+  <line x1="666" y1="284" x2="666" y2="304" stroke="#57606a" stroke-width="1.5" marker-end="url(#arw2)"/>
+
+  <rect x="56" y="308" width="396" height="90" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="1.5"/>
+  <text x="254" y="338" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1f2328" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">是</text>
+  <text x="254" y="362" text-anchor="middle" font-size="12" fill="#166534" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">/readyz → isolation_verified: true</text>
+  <text x="254" y="382" text-anchor="middle" font-size="11.5" fill="#57606a" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">isolation 是配置意图，这个是实测</text>
+
+  <rect x="468" y="308" width="396" height="90" rx="10" fill="#fff7ed" stroke="#ea580c" stroke-width="1.5"/>
+  <text x="666" y="338" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1f2328" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">否 / 自检根本没跑起来</text>
+  <text x="666" y="362" text-anchor="middle" font-size="12" fill="#9a3412" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">/readyz → isolation_verified: false</text>
+  <text x="666" y="382" text-anchor="middle" font-size="11.5" fill="#57606a" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">并说明原因 —— 不把它渲染成「已验证」</text>
+
+  <text x="460" y="436" text-anchor="middle" font-size="12" fill="#57606a" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">运行中的等级随时可核对：GET /readyz 与 GET /v1/isolation（需 admin）—— 不必信任本文档</text>
+</svg>

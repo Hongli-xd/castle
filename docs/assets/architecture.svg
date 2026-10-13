@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 580" width="920" height="580" role="img" aria-label="Sandcastle 分层架构：客户端 → sandboxd 内部五层 → Docker Engine API → OCI 容器">
+  <defs>
+    <marker id="arw" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L9,4.5 L0,9 z" fill="#57606a"/>
+    </marker>
+  </defs>
+
+  <rect width="920" height="580" fill="#ffffff"/>
+
+  <!-- clients -->
+  <rect x="248" y="18" width="424" height="64" rx="10" fill="#eef2ff" stroke="#6366f1" stroke-width="1.5"/>
+  <text x="460" y="44" text-anchor="middle" font-size="14.5" font-weight="600" fill="#1f2328" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">pi agent / SDK / CLI / 任意 HTTP 客户端</text>
+  <text x="460" y="66" text-anchor="middle" font-size="12" fill="#57606a" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">REST + Bearer sk_...（TLS 可选）</text>
+  <line x1="460" y1="82" x2="460" y2="104" stroke="#57606a" stroke-width="1.5" marker-end="url(#arw)"/>
+
+  <!-- daemon -->
+  <rect x="56" y="106" width="808" height="366" rx="14" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1.5"/>
+  <text x="76" y="131" font-size="13" font-weight="700" fill="#1f2328" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">sandboxd（单二进制 · 零第三方依赖）</text>
+
+  <!-- layer 1 -->
+  <rect x="76" y="144" width="768" height="52" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+  <rect x="76" y="144" width="5" height="52" rx="2.5" fill="#6366f1"/>
+  <text x="98" y="166" font-size="12.5" fill="#1f2328" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">httpapi · 中间件管线 —— 顺序即安全契约（两把限流器，两个身份）</text>
+  <text x="98" y="185" font-size="11.5" fill="#57606a" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">recover → request-id → pre-auth limit(按 IP) → body-limit → authenticate → per-tenant limit(按租户) → handler</text>
+
+  <!-- layer 2 -->
+  <rect x="76" y="206" width="768" height="52" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+  <rect x="76" y="206" width="5" height="52" rx="2.5" fill="#0ea5e9"/>
+  <text x="98" y="228" font-size="12.5" fill="#1f2328" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">service · 生命周期状态机 · 预热池 · 快照与分层模板 · pack 防泄漏</text>
+  <text x="98" y="247" font-size="11.5" fill="#57606a" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">TTL / 空闲双维回收 · reconciler 周期对账 · 过渡态让崩溃可判定</text>
+
+  <!-- layer 3 -->
+  <rect x="76" y="268" width="768" height="52" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+  <rect x="76" y="268" width="5" height="52" rx="2.5" fill="#a855f7"/>
+  <text x="98" y="290" font-size="12.5" fill="#1f2328" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">gov · 租户治理：Key 认证 · 令牌桶限流 · 配额 · 追加式审计</text>
+  <text x="98" y="309" font-size="11.5" fill="#57606a" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">Key 仅存哈希、明文只出现一次、常数时间比对 · 429 带 Retry-After</text>
+
+  <!-- layer 4 -->
+  <rect x="76" y="330" width="768" height="52" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+  <rect x="76" y="330" width="5" height="52" rx="2.5" fill="#f59e0b"/>
+  <text x="98" y="352" font-size="12.5" fill="#1f2328" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">store · 崩溃安全 WAL · flock 防双进程 · CAS 乐观锁</text>
+  <text x="98" y="371" font-size="11.5" fill="#57606a" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">每事务一帧 + fsync · 撕裂尾部自动截断 · 周期压实</text>
+
+  <!-- layer 5 -->
+  <rect x="76" y="392" width="768" height="52" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+  <rect x="76" y="392" width="5" height="52" rx="2.5" fill="#10b981"/>
+  <text x="98" y="414" font-size="12.5" fill="#1f2328" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">runtime · Backend 接口（唯一回答「这台机器上真实存在什么」的一层）</text>
+  <text x="98" y="433" font-size="11.5" fill="#57606a" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">oci（Docker 容器，可用）　▸　firecracker（编译期检查、运行期不可用：无 /dev/kvm 时诚实拒绝）</text>
+
+  <line x1="460" y1="472" x2="460" y2="494" stroke="#57606a" stroke-width="1.5" marker-end="url(#arw)"/>
+
+  <!-- docker -->
+  <rect x="56" y="496" width="808" height="64" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="1.5"/>
+  <text x="460" y="522" text-anchor="middle" font-size="12.5" fill="#1f2328" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">Docker Engine API（unix socket 上的 HTTP —— 生产从不 exec.Command("docker")）</text>
+  <text x="460" y="543" text-anchor="middle" font-size="11.5" fill="#57606a" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">OCI 容器：net=none · CapDrop ALL · no-new-privileges · pids / CPU / 内存硬限</text>
+</svg>

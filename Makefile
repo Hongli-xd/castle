@@ -1,6 +1,6 @@
 BINARY := bin/sandboxd
 CLI := bin/sbxctl
-VERSION ?= 1.1.7
+VERSION ?= 1.1.8
 
 .PHONY: build test test-race test-int test-e2e test-e2e-race test-e2e-destructive \
         test-commercial bench scenario scenario-flow fmt vet clean
