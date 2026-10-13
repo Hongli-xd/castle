@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -30,7 +31,7 @@ import (
 	"sandcastle.dev/sandcastle/internal/store"
 )
 
-var version = "1.0.0"
+var version = "1.1.6"
 
 func logf(level, format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
@@ -57,22 +58,32 @@ func run(configPath string) error {
 	if err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
-	logf("info", "sandboxd %s starting; listen=%s data_dir=%s", version, cfg.Listen, cfg.DataDir)
+	logf("info", "sandboxd %s starting; listen=%s data_dir=%s isolation=%s",
+		version, cfg.Listen, cfg.DataDir, cfg.Isolation)
 
-	if fc.Available() {
-		logf("warn", "KVM present but the firecracker backend is a skeleton in this build; using oci backend (docs/DESIGN.md §3.5)")
-	}
 	backend, err := buildBackend(cfg)
 	if err != nil {
 		return err
 	}
 	ctx := context.Background()
 
-	st, err := store.Open(cfg.DataDir, store.Options{MaxEvents: cfg.KeepEvents})
+	st, err := store.Open(cfg.DataDir, store.Options{
+		MaxEvents: cfg.KeepEvents,
+		Repair:    repairPolicy(cfg.WALRepair),
+	})
 	if err != nil {
 		return fmt.Errorf("store: %w", err)
 	}
 	defer st.Close()
+
+	// Recovery is never silent. A torn tail is normal crash debris and is
+	// reported as such; anything more serious refuses to start inside
+	// store.Open, so if we get here the data is accounted for.
+	if rep := st.Repair(); rep.Damaged {
+		logf("warn", "wal recovery: %s", rep.String())
+	} else if rep.Action == "none" {
+		logf("info", "wal recovery: intact (%d frames replayed)", rep.FramesKept)
+	}
 
 	reg := metrics.New()
 	svc := service.New(st, backend, cfg, reg)
@@ -81,6 +92,12 @@ func run(configPath string) error {
 		return err
 	}
 	bootstrapTemplates(ctx, st, backend, cfg)
+
+	// Prove the isolation before serving the first request: a claim that only
+	// appears in the log once traffic is flowing is a claim nobody checked.
+	if err := isolationSelfCheck(cfg, svc); err != nil {
+		return err
+	}
 
 	svc.StartLoops()
 	// converge whatever the previous process left mid-flight, before the
@@ -129,19 +146,138 @@ func run(configPath string) error {
 	return nil
 }
 
+// buildBackend resolves the isolation tier the operator asked for against what
+// this host can actually deliver, and refuses the mismatch.
+//
+// v1.1.0 had no selection at all: it logged a warning when /dev/kvm existed and
+// then unconditionally returned the container backend, so the microVM backend
+// was unreachable at runtime and nothing outside the process could tell. An
+// operator who chose this product *because* it promised microVM isolation got
+// shared-kernel containers with a log line they never read.
 func buildBackend(cfg *config.Config) (runtime.Backend, error) {
+	switch cfg.Isolation {
+	case config.IsolationMicroVM:
+		if !fc.Available() {
+			return nil, fmt.Errorf(
+				"isolation=microvm was required but this host exposes no /dev/kvm; refusing to start " +
+					"rather than silently serving weaker isolation. Deploy on Linux with KVM, or set " +
+					"isolation=container to accept the shared-kernel tier explicitly")
+		}
+		// KVM is present but the driver is not implemented in this build.
+		// The honest answer is to refuse, not to start anyway and hope nobody
+		// checks: docs/DESIGN.md §3.5 calls this the honesty contract.
+		return nil, fmt.Errorf(
+			"isolation=microvm was required and /dev/kvm is present, but the %s driver is still a "+
+				"compile-checked skeleton in this build (it returns unimplemented for every operation, "+
+				"and this daemon has no backend-selection path to it). No microVM isolation exists yet. "+
+				"Set isolation=container to make that trade-off explicit",
+			fc.New().Name())
+
+	case config.IsolationContainer:
+		return buildOCIBackend(cfg)
+
+	default: // IsolationAuto
+		if fc.Available() {
+			logf("warn", "this host has /dev/kvm, but the firecracker driver is a skeleton in this "+
+				"build, so auto-selection stays on containers (shared kernel). Set isolation=microvm "+
+				"to turn this silent-looking fallback into a startup failure")
+		}
+		return buildOCIBackend(cfg)
+	}
+}
+
+// repairPolicy maps the config string onto the store's recovery policy. config
+// deliberately does not import store, so the translation lives here.
+func repairPolicy(s string) store.RepairPolicy {
+	switch s {
+	case config.WALRepairSalvage:
+		return store.RepairSalvage
+	case config.WALRepairStrict:
+		return store.RepairStrict
+	default:
+		return store.RepairTailOnly
+	}
+}
+
+func buildOCIBackend(cfg *config.Config) (runtime.Backend, error) {
 	client, err := oci.NewClient(cfg.DockerHost)
 	if err != nil {
 		return nil, fmt.Errorf("runtime backend: %w", err)
 	}
-	b := oci.New(client)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	b := oci.NewWithOptions(client, oci.Options{Userns: cfg.Userns})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := b.Ping(ctx); err != nil {
 		return nil, fmt.Errorf("runtime backend unreachable at boot: %w", err)
 	}
-	logf("info", "backend=oci ready")
+	// Init reads the daemon's own /info and fixes the user-namespace posture
+	// for the process lifetime. This is what makes userns=require meaningful:
+	// a container engine accepts and echoes back security settings it cannot
+	// honour, so the capability must be established from the daemon rather
+	// than requested from it and assumed.
+	if err := b.Init(ctx); err != nil {
+		return nil, err
+	}
+	mode, note := b.UsernsPosture()
+	logf("info", "backend=%s isolation=%s userns=%s ready", b.Name(), b.IsolationTier(), mode)
+	logf("info", "userns posture: %s", note)
+	if mode != "private" {
+		logf("warn", "USER NAMESPACE OFF: uid 0 inside a sandbox is uid 0 on this host, so one kernel "+
+			"bug reaches host root with no second privilege escalation and the other container controls "+
+			"(dropped capabilities, seccomp, LSM) stop mattering the moment it is crossed. Set "+
+			"userns=require to make this a startup failure, or configure userns-remap in daemon.json")
+	}
+	if b.IsolationTier() != runtime.TierMicroVM {
+		logf("warn", "ISOLATION TIER: sandboxes share this host's kernel. This tier is appropriate "+
+			"for trusted or semi-trusted tenants; it is NOT adequate for running arbitrary untrusted "+
+			"code. Verify at any time with GET /readyz → .isolation")
+	}
 	return b, nil
+}
+
+// isolationSelfCheck asks the backend to prove its isolation on this host and
+// records the evidence where /readyz and the admin API can serve it.
+//
+// The whole point is that configuration is not evidence. Every container
+// setting this daemon writes is a request; only what the kernel reports from
+// inside a sandbox is a fact. So the check is run against a sandbox built by
+// the identical payload path production uses, and its findings are logged
+// individually — including the ones that pass, because a report that only
+// speaks up when something is wrong cannot be distinguished from a report
+// that never ran.
+func isolationSelfCheck(cfg *config.Config, svc *service.Service) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	rep, err := svc.Backend.VerifyIsolation(ctx, cfg.BootstrapImage)
+	if err != nil {
+		if cfg.Userns == config.UsernsRequire {
+			return fmt.Errorf("userns=require demands proof of isolation, but the self-check could "+
+				"not run: %w", err)
+		}
+		logf("warn", "isolation self-check could not run (%v) — the isolation reported at /readyz is "+
+			"configuration, not verified evidence", err)
+		return nil
+	}
+	svc.SetIsolationReport(rep)
+
+	logf("info", "isolation self-check in %s: tier=%s userns=%s verified=%v",
+		rep.Image, rep.Tier, rep.Userns, rep.OK())
+	for _, f := range rep.Facts {
+		state := "ok  "
+		if !f.OK {
+			state = "FAIL"
+		}
+		logf("info", "  isolation %s %-13s = %-20q want %s", state, f.Name, f.Observed, f.Want)
+	}
+	if !rep.OK() {
+		if cfg.Userns == config.UsernsRequire {
+			return fmt.Errorf("userns=require was set and the isolation self-check failed: %s",
+				strings.Join(rep.Failures, "; "))
+		}
+		logf("warn", "isolation self-check failed: %s", strings.Join(rep.Failures, "; "))
+	}
+	return nil
 }
 
 // bootstrapAdmin ensures exactly one live admin key exists. The plaintext is
@@ -154,6 +290,13 @@ func bootstrapAdmin(st *store.Store, svc *service.Service, cfg *config.Config) e
 	}
 	var plaintext string
 	var err error
+	// Only a key this process GENERATED is echoed. A key the operator
+	// supplied in configuration is already in the config file, and stdout
+	// goes to the journal — printing it again would leave a live
+	// platform-admin credential in a log with a retention policy nobody
+	// chose. Found by the end-to-end suite, which asserts that no credential
+	// reaches the daemon's output.
+	generated := false
 	if cfg.BootstrapAdminKey != "" {
 		plaintext = cfg.BootstrapAdminKey
 		k := domain.NewAPIKey("", "bootstrap", domain.ScopeAdmin)
@@ -163,9 +306,14 @@ func bootstrapAdmin(st *store.Store, svc *service.Service, cfg *config.Config) e
 		err = st.PutKey(k)
 	} else {
 		plaintext, _, err = svc.Auth.MintKey("", "bootstrap-admin", domain.ScopeAdmin, 0)
+		generated = true
 	}
 	if err != nil {
 		return err
+	}
+	if !generated {
+		logf("info", "bootstrap admin key taken from configuration; not printed")
+		return nil
 	}
 	fmt.Println("===============================================")
 	fmt.Println("sandboxd ADMIN API KEY (printed once; store it):")

@@ -19,19 +19,141 @@ const (
 	labelTenant  = "sandbox.tenant"
 	prodValue    = "sandboxd"
 
-	defaultOutputCap = 1 << 20 // 1 MiB per stream
-	startProbeDelay  = 100 * time.Millisecond
-	startProbeMax    = 10 * time.Second
+	startProbeDelay = 100 * time.Millisecond
+	startProbeMax   = 10 * time.Second
 )
 
 // Backend implements runtime.Backend with Docker containers.
 type Backend struct {
-	c *Client
+	c    *Client
+	opts Options
+
+	// Filled in by Init from the daemon's own /info. "Not probed" leaves
+	// usernsMode empty, which is the identity-map posture — an unverified
+	// backend must never claim a user namespace it has not confirmed.
+	probed       bool
+	usernsMode   string // "" = host/identity map, "private" = remapped
+	usernsNote   string
+	apparmorHost bool // daemon reports AppArmor, so the profile can be pinned
 }
 
-func New(c *Client) *Backend { return &Backend{c: c} }
+// User-namespace postures accepted by Options.Userns.
+const (
+	// UsernsAuto enables user-namespace isolation when this daemon can
+	// actually provide it, and otherwise discloses the downgrade in the
+	// startup log and at /readyz.
+	UsernsAuto = "auto"
+	// UsernsRequire refuses to start when this daemon cannot provide it.
+	UsernsRequire = "require"
+	// UsernsOff accepts the shared-identity tier as a conscious choice.
+	UsernsOff = "off"
+)
+
+// Options configure the container security posture.
+type Options struct {
+	// Userns selects the user-namespace posture (UsernsAuto/Require/Off).
+	//
+	// This is a three-way switch rather than a bool because the failure mode
+	// it guards against is a silent no-op. HostConfig.UsernsMode="private" is
+	// not a request the engine can honour on demand: a daemon with no
+	// userns-remap accepts the field, stores it, and returns it verbatim from
+	// GET /containers/<id>/json — while the sandbox still runs with the
+	// identity uid map. Setting "private" unconditionally therefore buys
+	// nothing and costs a great deal: it makes the control plane report a
+	// user namespace that does not exist. See Client.info/hasUserns.
+	Userns string
+}
+
+func New(c *Client) *Backend { return NewWithOptions(c, Options{}) }
+
+func NewWithOptions(c *Client, opts Options) *Backend {
+	if opts.Userns == "" {
+		opts.Userns = UsernsAuto
+	}
+	return &Backend{
+		c:    c,
+		opts: opts,
+		// Until Init has established what this daemon can do, ask for the
+		// identity map explicitly. The alternative — leaving the field unset
+		// and letting the engine decide — is not neutral: an engine with
+		// userns-remap configured defaults new containers to a private user
+		// namespace, so an unset field silently means "private" on some hosts
+		// and "host" on others. Pinning "host" keeps the unverified state
+		// honest, and Init replaces it with the verified posture.
+		usernsMode: UsernsModeHost,
+	}
+}
+
+// Values sent in HostConfig.UsernsMode. "host" is written explicitly rather
+// than omitted, because omission delegates the decision to daemon.json.
+const (
+	UsernsModeHost    = "host"
+	UsernsModePrivate = "private"
+)
 
 func (b *Backend) Name() string { return "oci" }
+
+// IsolationTier is honest about what a container gives you: a shared kernel.
+// There is no configuration of the Docker Engine API that changes this.
+func (b *Backend) IsolationTier() string { return runtime.TierContainer }
+
+// UsernsPosture reports the decided user-namespace posture for logs and
+// /readyz. Before Init it reports the conservative truth: not established.
+func (b *Backend) UsernsPosture() (mode, note string) {
+	if !b.probed {
+		return "unverified", "user-namespace posture not probed yet"
+	}
+	if b.usernsMode == UsernsModePrivate {
+		return "private", b.usernsNote
+	}
+	return "off", b.usernsNote
+}
+
+// Init probes the daemon once and fixes the user-namespace posture for the
+// lifetime of this backend.
+//
+// Create is deliberately safe to call without it: an unprobed backend runs in
+// the identity-map posture rather than optimistically asking for a namespace
+// it cannot get. That ordering matters — the one thing this must never do is
+// report isolation it has not established.
+func (b *Backend) Init(ctx context.Context) error {
+	info, err := b.c.info(ctx)
+	if err != nil {
+		return err
+	}
+	b.probed = true
+	b.apparmorHost = info.hasSecurityOption("apparmor")
+	available := info.hasUserns()
+
+	switch b.opts.Userns {
+	case UsernsRequire:
+		if !available {
+			return fmt.Errorf(
+				"userns=require was set, but this docker daemon has no user-namespace remap "+
+					"configured (GET /info → SecurityOptions %v contains no \"name=userns\"). "+
+					"Without it, container uid 0 IS host uid 0, so a single kernel bug reaches host "+
+					"root directly with no second privilege escalation — the other isolation layers "+
+					"stop mattering the moment one is crossed. Add a userns-remap entry to "+
+					"daemon.json and restart the daemon, or set userns=off to accept that tier "+
+					"explicitly", info.SecurityOptions)
+		}
+		b.usernsMode = UsernsModePrivate
+		b.usernsNote = "active: container uid 0 maps to an unprivileged host uid"
+	case UsernsOff:
+		b.usernsMode = UsernsModeHost
+		b.usernsNote = "disabled by configuration (userns=off): container uid 0 is host uid 0"
+	default: // UsernsAuto
+		if available {
+			b.usernsMode = UsernsModePrivate
+			b.usernsNote = "active: container uid 0 maps to an unprivileged host uid"
+		} else {
+			b.usernsMode = UsernsModeHost
+			b.usernsNote = "unavailable on this daemon (no userns-remap), so container uid 0 is host " +
+				"uid 0; set userns=require to turn this disclosed downgrade into a startup failure"
+		}
+	}
+	return nil
+}
 
 func (b *Backend) Ping(ctx context.Context) error { return b.c.ping(ctx) }
 
@@ -47,15 +169,69 @@ type createBody struct {
 	HostConfig hostConfig        `json:"HostConfig"`
 }
 
+// hostConfig is the security contract. Every field a sandbox depends on is
+// written here explicitly, even where the value matches today's engine
+// default, because anything omitted is delegated to the host's daemon.json —
+// a mutable file that a different engine version or a different operator can
+// change without this code changing. The fields that genuinely have a
+// daemon-level default capable of weakening a sandbox are IpcMode
+// (default-ipc-mode), CgroupnsMode (default-cgroupns-mode), UsernsMode
+// (userns-remap), Ulimits (default-ulimits), SecurityOpt's seccomp/apparmor
+// entries (seccomp-profile) and Runtime (default-runtime, to be pinned when a
+// runtime-selection knob lands). The rest are pinned so that the contract can
+// be reviewed in one place instead of reconstructed from the engine's source.
 type hostConfig struct {
-	Resources     resources `json:"Resources"`
-	NetworkMode   string    `json:"NetworkMode"`
-	CapDrop       []string  `json:"CapDrop"`
-	SecurityOpt   []string  `json:"SecurityOpt"`
-	Init          *bool     `json:"Init,omitempty"`
-	RestartPolicy struct {
+	Resources    resources `json:"Resources"`
+	NetworkMode  string    `json:"NetworkMode"`
+	IpcMode      string    `json:"IpcMode"`
+	PidMode      string    `json:"PidMode"`
+	UsernsMode   string    `json:"UsernsMode"`
+	CgroupnsMode string    `json:"CgroupnsMode"`
+	Privileged   *bool     `json:"Privileged"`
+	// ReadonlyRootfs is pinned false on purpose, not by omission. A read-only
+	// root is the usual next hardening step, but it is incompatible with this
+	// product's snapshot model: Commit() captures the container's writable
+	// layer, so a read-only root would produce empty snapshots. Revisit only
+	// together with a writable-workspace overlay design.
+	ReadonlyRootfs *bool    `json:"ReadonlyRootfs"`
+	CapDrop        []string `json:"CapDrop"`
+	CapAdd         []string `json:"CapAdd"`
+	SecurityOpt    []string `json:"SecurityOpt"`
+	MaskedPaths    []string `json:"MaskedPaths"`
+	ReadonlyPaths  []string `json:"ReadonlyPaths"`
+	Ulimits        []ulimit `json:"Ulimits"`
+	Init           *bool    `json:"Init,omitempty"`
+	RestartPolicy  struct {
 		Name string `json:"Name"`
 	} `json:"RestartPolicy"`
+	// Mounts carries the read-only host bind mounts, when the caller asked
+	// for any. It is omitempty on purpose: an absent field is the engine's
+	// "no mounts" default, and there is no daemon.json knob that can inject
+	// a mount on its own, so nothing here needs pinning against a mutable
+	// default the way UsernsMode or SecurityOpt do.
+	Mounts []mountSpec `json:"Mounts,omitempty"`
+}
+
+// mountSpec is a read-only bind mount. ReadOnly is written explicitly true on
+// every code path that can construct one; there is no branch that sets it
+// false. Propagation rprivate keeps a mount the workload makes inside the
+// sandbox from propagating back to the host's namespace.
+type mountSpec struct {
+	Type        string       `json:"Type"`        // "bind"
+	Source      string       `json:"Source"`      // absolute host path
+	Target      string       `json:"Target"`      // absolute in-sandbox path
+	ReadOnly    bool         `json:"ReadOnly"`    // always true
+	BindOptions *bindOptions `json:"BindOptions"` // always rprivate
+}
+
+type bindOptions struct {
+	Propagation string `json:"Propagation"` // "rprivate"
+}
+
+type ulimit struct {
+	Name string `json:"Name"`
+	Soft int64  `json:"Soft"`
+	Hard int64  `json:"Hard"`
 }
 
 type resources struct {
@@ -63,6 +239,105 @@ type resources struct {
 	Memory     int64  `json:"Memory"`     // bytes
 	MemorySwap int64  `json:"MemorySwap"` // == Memory → swap disabled
 	PidsLimit  *int64 `json:"PidsLimit"`
+}
+
+// Paths the engine masks and makes read-only by default, pinned here. Nothing
+// stops a daemon or a future engine version from changing these defaults, and
+// a sandbox that can read /proc/kcore or write /proc/sys is a materially
+// different sandbox.
+var (
+	pinnedMaskedPaths = []string{
+		"/proc/asound", "/proc/acpi", "/proc/kcore", "/proc/keys",
+		"/proc/latency_stats", "/proc/timer_list", "/proc/timer_stats",
+		"/proc/sched_debug", "/proc/scsi", "/sys/firmware",
+		"/sys/devices/virtual/powercap",
+	}
+	pinnedReadonlyPaths = []string{
+		"/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger",
+	}
+)
+
+// pinnedUlimits bound the two resource classes the pids and memory cgroups do
+// not cover.
+//
+// core=0 is a data-exfiltration control rather than housekeeping: this product
+// commits a sandbox's filesystem into snapshots, so a core dump writes the
+// process's memory — including any credential it was holding — into an
+// artifact that is then stored and handed to other sandboxes.
+//
+// nofile is a cross-tenant availability control: file descriptors are a
+// host-global resource, so with no per-sandbox ceiling one tenant can exhaust
+// the host table and starve every other tenant.
+var pinnedUlimits = []ulimit{
+	{Name: "core", Soft: 0, Hard: 0},
+	{Name: "nofile", Soft: 1024, Hard: 65536},
+}
+
+func (b *Backend) createPayload(req runtime.CreateRequest) createBody {
+	pids := int64(512)
+	no := false
+	secOpt := []string{"no-new-privileges"}
+	if b.apparmorHost {
+		// Pin the profile instead of relying on the engine to attach its
+		// default one; only done when /info says AppArmor is present, because
+		// naming a profile on a host without AppArmor is an error.
+		secOpt = append(secOpt, "apparmor=docker-default")
+	}
+	mounts := bindMounts(req.Mounts)
+	return createBody{
+		Image:      req.Image,
+		Cmd:        []string{"/bin/sh", "-c", "exec sleep infinity"}, // stable PID 1; workloads run via exec
+		Env:        envSlice(req.Env),
+		User:       req.User,
+		WorkingDir: req.WorkDir,
+		Labels:     withProduct(req.Labels),
+		HostConfig: hostConfig{
+			Resources: resources{
+				NanoCPUs:   int64(req.CPUMillicores) * 1_000_000,
+				Memory:     int64(req.MemoryMiB) << 20,
+				MemorySwap: int64(req.MemoryMiB) << 20, // swap off: an OOM must hit this sandbox only, and visibly
+				PidsLimit:  &pids,
+			},
+			NetworkMode:    "none",
+			IpcMode:        "private",
+			PidMode:        "",
+			UsernsMode:     b.usernsMode,
+			CgroupnsMode:   "private",
+			Privileged:     &no,
+			ReadonlyRootfs: &no,
+			CapDrop:        []string{"ALL"},
+			CapAdd:         []string{},
+			SecurityOpt:    secOpt,
+			MaskedPaths:    pinnedMaskedPaths,
+			ReadonlyPaths:  pinnedReadonlyPaths,
+			Ulimits:        pinnedUlimits,
+			Init:           boolPtr(true), // reap zombies from workload execs
+			RestartPolicy: struct {
+				Name string `json:"Name"`
+			}{Name: "no"},
+			Mounts: mounts,
+		},
+	}
+}
+
+// bindMounts renders runtime mounts as read-only Docker bind mounts. ReadOnly
+// is set true unconditionally — the runtime type has no writable mode, so
+// there is no caller value that can flip it.
+func bindMounts(in []runtime.Mount) []mountSpec {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]mountSpec, 0, len(in))
+	for _, m := range in {
+		out = append(out, mountSpec{
+			Type:        "bind",
+			Source:      m.Source,
+			Target:      m.Target,
+			ReadOnly:    true,
+			BindOptions: &bindOptions{Propagation: "rprivate"},
+		})
+	}
+	return out
 }
 
 type inspectBody struct {
@@ -112,31 +387,7 @@ func envSlice(env map[string]string) []string {
 // ---- lifecycle ---------------------------------------------------------------
 
 func (b *Backend) Create(ctx context.Context, req runtime.CreateRequest) (string, error) {
-	pids := int64(512)
-	body := createBody{
-		Image:      req.Image,
-		Cmd:        []string{"/bin/sh", "-c", "exec sleep infinity"}, // stable PID 1; workloads run via exec
-		Env:        envSlice(req.Env),
-		User:       req.User,
-		WorkingDir: req.WorkDir,
-		Labels:     withProduct(req.Labels),
-		HostConfig: hostConfig{
-			Resources: resources{
-				NanoCPUs:   int64(req.CPUMillicores) * 1_000_000,
-				Memory:     int64(req.MemoryMiB) << 20,
-				MemorySwap: int64(req.MemoryMiB) << 20, // swap off: an OOM must hit this sandbox only, and visibly
-				PidsLimit:  &pids,
-			},
-			NetworkMode: "none",
-			CapDrop:     []string{"ALL"},
-			SecurityOpt: []string{"no-new-privileges"},
-			Init:        boolPtr(true), // reap zombies from workload execs
-			RestartPolicy: struct {
-				Name string `json:"Name"`
-			}{Name: "no"},
-		},
-	}
-	payload, _ := json.Marshal(body)
+	payload, _ := json.Marshal(b.createPayload(req))
 	respBody, err := b.c.do(ctx, "POST", "/containers/create?name="+urlQueryEscape(req.Name), nil, bytes.NewReader(payload))
 	if err != nil {
 		if ae, ok := asAppErr(err); ok && ae.Code == apperr.NotFound {
@@ -363,6 +614,11 @@ func (b *Backend) Exec(ctx context.Context, ref string, req runtime.ExecRequest)
 	if len(req.Argv) == 0 {
 		return nil, apperr.Invalid("exec requires a non-empty argv")
 	}
+	// Reject an out-of-contract ceiling before creating anything in Docker.
+	if req.MaxOutput > runtime.MaxBackendOutput {
+		return nil, apperr.Invalid("exec max_output %d exceeds the backend's hard ceiling of %d bytes",
+			req.MaxOutput, runtime.MaxBackendOutput)
+	}
 	timeout := req.Timeout
 	if timeout <= 0 {
 		timeout = defaultExecTO
@@ -452,7 +708,15 @@ func (b *Backend) execStart(execCtx context.Context, execID string, started time
 
 	cap := int64(maxOut)
 	if cap <= 0 {
-		cap = defaultOutputCap
+		cap = runtime.DefaultOutputCap
+	}
+	// Defence in depth. The service layer is the authority on the ceiling, but
+	// this backend is also driven directly by tests and future callers, and a
+	// forgotten admission check must not turn into a multi-gigabyte heap
+	// allocation here (that is exactly how PoC-4 worked).
+	if cap > runtime.MaxBackendOutput {
+		return nil, apperr.Invalid("exec max_output %d exceeds the backend's hard ceiling of %d bytes",
+			cap, runtime.MaxBackendOutput)
 	}
 	deadline := started.Add(timeout)
 	res := &runtime.ExecResult{}
@@ -619,6 +883,43 @@ func (b *Backend) Orphans(ctx context.Context) ([]runtime.Orphan, error) {
 			Labels: it.Labels,
 			Status: ins.toStatus(),
 		})
+	}
+	return out, nil
+}
+
+// managedImagePrefixes are the repository names this product commits to. The
+// reference filter below is what keeps the call cheap on a shared daemon: a
+// node may hold thousands of unrelated images, and enumerating them all on
+// every reconcile tick would be a self-inflicted load spike.
+var managedImagePrefixes = []string{"sandboxd-snap-", "sandboxd-tpl-"}
+
+func (b *Backend) ManagedImages(ctx context.Context) ([]string, error) {
+	patterns := make([]string, 0, len(managedImagePrefixes))
+	for _, p := range managedImagePrefixes {
+		patterns = append(patterns, p+"*")
+	}
+	raw, err := json.Marshal(map[string][]string{"reference": patterns})
+	if err != nil {
+		return nil, apperr.InternalErr("encode image filters: %v", err)
+	}
+	body, err := b.c.do(ctx, "GET", "/images/json", map[string]string{"filters": string(raw)}, nil)
+	if err != nil {
+		return nil, err
+	}
+	var list []struct {
+		RepoTags []string `json:"RepoTags"`
+	}
+	if err := json.Unmarshal(body, &list); err != nil {
+		return nil, apperr.InternalErr("docker image list unparseable: %v", err)
+	}
+	out := make([]string, 0, len(list))
+	for _, im := range list {
+		for _, tag := range im.RepoTags {
+			if tag == "<none>:<none>" {
+				continue
+			}
+			out = append(out, tag)
+		}
 	}
 	return out, nil
 }

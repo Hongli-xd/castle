@@ -37,6 +37,8 @@ func New() *Backend { return &Backend{} }
 
 func (b *Backend) Name() string { return "firecracker" }
 
+func (b *Backend) IsolationTier() string { return runtime.TierMicroVM }
+
 func kvmRequired() error {
 	return apperr.Unimpl("firecracker backend requires /dev/kvm; this host does not expose it — deploy on a Linux host with nested virtualization or bare metal")
 }
@@ -103,5 +105,16 @@ func (b *Backend) ImportRootfs(ctx context.Context, rootfsDir, tag string) (stri
 }
 
 func (b *Backend) Orphans(ctx context.Context) ([]runtime.Orphan, error) {
+	return nil, kvmRequired()
+}
+
+func (b *Backend) ManagedImages(ctx context.Context) ([]string, error) {
+	return nil, kvmRequired()
+}
+
+// VerifyIsolation cannot report anything yet, and says so rather than
+// returning an empty report that a caller might read as "nothing to object
+// to". A report with no facts is not a clean bill of health.
+func (b *Backend) VerifyIsolation(ctx context.Context, image string) (*runtime.IsolationReport, error) {
 	return nil, kvmRequired()
 }

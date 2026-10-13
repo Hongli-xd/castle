@@ -113,8 +113,13 @@ func (s *Service) DeleteSnapshot(ctx context.Context, tenantID, keyID, snapshotI
 		return err
 	}
 	if sn.ImageRef != "" {
-		// image removal is best-effort: the record is gone either way, and
-		// the node GC reaps untagged images
+		// Best effort here, but not because anyone else will clean up: a
+		// snapshot image is tagged (sandboxd-snap-<id>), so it is not
+		// *dangling* and `docker image prune` will never remove it. This
+		// call and the reconciler's image pass are the only two things that
+		// ever delete one. The previous comment claimed "the node GC reaps
+		// untagged images", which was wrong on both counts (the images are
+		// tagged, and no GC looks for them).
 		_ = s.Backend.RemoveImage(ctx, sn.ImageRef)
 	}
 	_ = s.Audit.Record(tenantID, "", keyID, domain.ActSnapshotDelete, map[string]string{"snapshot": sn.ID})

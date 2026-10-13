@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"strconv"
+	"sync"
 	"time"
 
 	"sandcastle.dev/sandcastle/internal/apperr"
@@ -98,7 +99,7 @@ func (s *Service) transition(ctx context.Context, sb *domain.Sandbox, mid, done 
 		return nil, err
 	}
 	_ = s.Audit.Record(sb.TenantID, sb.ID, actor, action, nil)
-	s.Reg.Counter("sandboxd_transitions_total", "sandbox state transitions", []string{"action"}, 1)
+	s.Reg.Counter("sandboxd_transitions_total", "sandbox state transitions", []string{"action", action}, 1)
 	return updated, nil
 }
 
@@ -173,9 +174,16 @@ func (s *Service) DeleteSandbox(ctx context.Context, tenantID, keyID, sandboxID 
 			return err
 		}
 	}
-	if err := s.St.DeleteSandbox(sb.ID, sb.Version); err != nil {
-		// record changed underneath (e.g. TTL fired concurrently): surface
-		// a conflict, the sweeper will finish the job
+	// The record deletion is deliberately CAS-free (-1). Delete is a terminal,
+	// idempotent operation: once force=true clears the active-state guard, the
+	// client's goal is "this sandbox is gone", and that goal does not change if
+	// a bookkeeping write (touchActivity, the reconciler, the sweeper — all of
+	// which bump Version even with baseVersion=-1) landed between loadOwned and
+	// here. Guarding the delete with sb.Version turned that harmless bump into a
+	// 409 that arrived *after* the container had already been removed — leaving
+	// the record stranded and the client with a spurious conflict. A concurrent
+	// delete's NotFound is equally the client's goal met, so it is success too.
+	if err := s.St.DeleteSandbox(sb.ID, -1); err != nil && apperr.From(err).Code != apperr.NotFound {
 		return err
 	}
 	_ = s.Audit.Record(tenantID, sb.ID, keyID, domain.ActSandboxDelete, map[string]string{"force": boolStr(force)})
@@ -217,7 +225,7 @@ func (s *Service) ListSandboxes(tenantID string, state *domain.SandboxState) []*
 
 // ---- exec & files ---------------------------------------------------------
 
-func (s *Service) Exec(ctx context.Context, tenantID, keyID, sandboxID string, req runtime.ExecRequest) (*runtime.ExecResult, error) {
+func (s *Service) Exec(ctx context.Context, tenantID, keyID, sandboxID string, req runtime.ExecRequest, idemKey string) (*runtime.ExecResult, error) {
 	sb, err := s.loadOwned(tenantID, sandboxID)
 	if err != nil {
 		return nil, err
@@ -232,9 +240,65 @@ func (s *Service) Exec(ctx context.Context, tenantID, keyID, sandboxID string, r
 	if req.Timeout <= 0 {
 		req.Timeout = 60 * time.Second
 	}
-	_ = s.Audit.Record(tenantID, sb.ID, keyID, domain.ActSandboxExec, map[string]string{"argv0": sanitize(first(req.Argv))})
-	s.Reg.Counter("sandboxd_execs_total", "sandbox execs", nil, 1)
-	return s.Backend.Exec(ctx, sb.Backend.Ref, req)
+	// max_output is a CEILING, not a preference. The control plane buffers the
+	// whole stdout+stderr in its own heap before trimming, so without this
+	// check one request could ask for 2 GB and make the daemon allocate
+	// hundreds of MiB of shared memory (poc/probe_live.sh, PoC-4). A negative
+	// value is rejected rather than treated as "default": the JSON field is
+	// int, so a client error would otherwise silently become a large unsigned
+	// cast downstream.
+	switch {
+	case req.MaxOutput < 0:
+		return nil, apperr.Invalid("exec max_output must not be negative")
+	case int64(req.MaxOutput) > s.Cfg.MaxExecOutput:
+		return nil, apperr.Invalid("exec max_output exceeds the platform maximum of %d bytes (0 selects the %s backend default of %d bytes)",
+			s.Cfg.MaxExecOutput, s.Backend.Name(), runtime.DefaultOutputCap)
+	}
+
+	// The actual execution — audit, metrics, metering, backend round trip —
+	// runs only when the command really runs. A replay must not emit a second
+	// sandbox.exec, count as a second exec, or bill a second command.
+	//
+	// The audit event's WAL fsync is the only sandboxd-side cost on this path
+	// that is not already amortised (measured ~4–5 ms on an SSD; see
+	// CHANGELOG v1.1.8). It is issued on its own goroutine so it overlaps the
+	// backend's Docker round-trips instead of serialising ahead of them, and
+	// auditDone.Wait() before returning keeps the durability contract intact:
+	// a confirmed exec (the response reaching the client) still implies its
+	// sandbox.exec event is fsynced — THREAT-MODEL "crash never drops an
+	// acknowledged event" is unchanged. The only shift is inside the request:
+	// the event used to be durable *before* the command started, now it is
+	// durable *before the response leaves*. A crash in that window (after the
+	// command started, before its audit landed) can drop the audit record for
+	// an exec whose response never reached the client.
+	exec := func() (*runtime.ExecResult, error) {
+		var auditDone sync.WaitGroup
+		auditDone.Add(1)
+		go func() {
+			defer auditDone.Done()
+			_ = s.Audit.Record(tenantID, sb.ID, keyID, domain.ActSandboxExec, map[string]string{"argv0": sanitize(first(req.Argv))})
+		}()
+		s.Reg.Counter("sandboxd_execs_total", "sandbox execs", nil, 1)
+		start := time.Now()
+		res, err := s.Backend.Exec(ctx, sb.Backend.Ref, req)
+		s.meter.RecordExec(tenantID, time.Since(start))
+		auditDone.Wait()
+		return res, err
+	}
+
+	if idemKey == "" {
+		return exec()
+	}
+	if err := validateIdempotencyKey(idemKey); err != nil {
+		return nil, err
+	}
+	key := tenantID + "\x00" + sandboxID + "\x00" + idemKey
+	res, replayed, err := s.idem.run(ctx, key, execFingerprint(req), exec)
+	if err == nil && replayed {
+		res.Replayed = true
+		s.Reg.Counter("sandboxd_execs_replayed_total", "exec responses served from the idempotency cache", nil, 1)
+	}
+	return res, err
 }
 
 func (s *Service) PutFile(ctx context.Context, tenantID, keyID, sandboxID, path string, content []byte, mode uint32) error {

@@ -5,7 +5,7 @@
 // extension, not the model.
 import { spawn } from "node:child_process";
 import { execSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,6 +24,10 @@ writeFileSync(confPath, [
 	'bootstrap.image = "sandboxd-test-base:alpine322"',
 	"pool.enabled = false",
 	`bootstrap_admin_key = "${ADMIN}"`,
+	// Allowlist the repo root so the extension's default workdir mount
+	// (process.cwd() → /workspace) is authorizable end-to-end. The repo lives
+	// under the user's home, which the Docker VM on this setup shares.
+	`mount.allow = "${root}"`,
 	"",
 ].join("\n"));
 
@@ -59,6 +63,7 @@ try {
 	process.env.SBX_TEMPLATE = tpl;
 	process.env.SBX_CPU = "500";
 	process.env.SBX_MEM = "256";
+	process.env.SBX_WORKDIR = root; // repo root → read-only at /workspace
 	const mod = await import(path.join(extDir, "index.ts"));
 
 	const registered = { tools: {}, commands: {}, handlers: {} };
@@ -92,12 +97,25 @@ try {
 	if (streamed.includes("pi-sbx-works")) ok("command output surfaced in tool result"); else bad("no output: " + JSON.stringify(result));
 	if (streamed.includes("aarch64") || streamed.includes("x86_64")) ok("real execution inside the sandbox (arch visible)"); else bad("arch missing");
 
-	let isoText = "";
+	// The workdir is now mounted read-only at /workspace by default, so the
+	// sandbox can read the real project but can never write it back.
+	let mountText = "";
 	try {
-		const iso = await registered.tools.bash.execute("call-2", { command: "test -d /workspace && echo mounted || echo not-mounted" }, undefined, () => {}, ui);
-		isoText = resultText(iso);
-	} catch (e) { isoText = String(e?.message); }
-	if (isoText.includes("not-mounted")) ok("host workspace NOT mounted (harder boundary by design)"); else bad("workspace state: " + isoText);
+		const m = await registered.tools.bash.execute("call-2", { command: "head -c 20 /workspace/go.mod" }, undefined, () => {}, ui);
+		mountText = resultText(m);
+	} catch (e) { mountText = String(e?.message); }
+	if (mountText.includes("module sandcastle")) ok("host workdir mounted read-only at /workspace"); else bad("workdir mount: " + mountText);
+
+	// Read-only is asserted by attempting a real write, not by `test -w`:
+	// root passes the mode-bit probe even on a read-only mount, but the actual
+	// write hits EROFS. The host repo must remain untouched.
+	let roText = "";
+	try {
+		const w = await registered.tools.bash.execute("call-2b", { command: "echo pwn > /workspace/.harness-write-probe 2>/dev/null && echo WROTE || echo BLOCKED" }, undefined, () => {}, ui);
+		roText = resultText(w);
+	} catch (e) { roText = String(e?.message); }
+	if (!roText.includes("WROTE")) ok("mount is read-only (write into /workspace blocked)"); else bad("mount writable: " + roText);
+	if (!existsSync(path.join(root, ".harness-write-probe"))) ok("host repo untouched by the sandbox write attempt"); else bad("write reached the host repo");
 
 	let exitMsg = "";
 	try {

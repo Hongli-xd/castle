@@ -29,14 +29,79 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// ready reports readiness AND the isolation tier actually in force.
+//
+// The tier is unauthenticated on purpose. It is the one fact a customer most
+// needs to verify independently, and it is not a secret: v1.1.0 advertised
+// microVM-grade isolation in its README while every running sandbox shared the
+// host kernel, and there was no way to tell from outside. Now there is.
 func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
-	if err := s.Svc.Backend.Ping(ctx); err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "backend unreachable", "detail": err.Error()})
+	tier := s.Svc.Backend.IsolationTier()
+	if err := s.Svc.St.Healthy(); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"status": "store unhealthy", "detail": err.Error(), "isolation": tier,
+		})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+	if err := s.Svc.Backend.Ping(ctx); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"status": "backend unreachable", "detail": err.Error(), "isolation": tier,
+		})
+		return
+	}
+	body := map[string]any{
+		"status":    "ready",
+		"backend":   s.Svc.Backend.Name(),
+		"isolation": tier,
+		// Makes the trade-off legible to whoever reads this endpoint, rather
+		// than leaving it to a footnote in a design doc.
+		"isolation_note": isolationNote(tier),
+	}
+	// The summary is unauthenticated on purpose: it is the one place a
+	// customer can confirm what they are actually getting without holding an
+	// API key. The detailed inventory stays behind the admin-only endpoint,
+	// because an accurate list of the controls in force is reconnaissance for
+	// whoever is planning an escape.
+	if rep := s.Svc.IsolationReport(); rep != nil {
+		body["isolation_verified"] = rep.OK()
+		body["isolation_checked_at"] = rep.CheckedAt
+		body["isolation_userns"] = rep.Userns
+		if !rep.OK() {
+			body["isolation_failures"] = rep.Failures
+		}
+	} else {
+		// "Not verified" is reported as its own state, never as success. The
+		// fields above describe intent; only the self-check describes reality.
+		body["isolation_verified"] = false
+		body["isolation_verified_note"] = "self-check has not run: the tier and note above are " +
+			"configuration, not verified evidence"
+	}
+	writeJSON(w, http.StatusOK, body)
+}
+
+// isolationReport serves the full self-check evidence. Admin-only: it is an
+// accurate inventory of which controls are in force, and that is exactly what
+// someone planning an escape wants to know.
+func (s *Server) isolationReport(w http.ResponseWriter, r *http.Request) {
+	rep := s.Svc.IsolationReport()
+	if rep == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"status": "not_run",
+			"detail": "the isolation self-check has not run, so there is no evidence either way; " +
+				"this is not a passing result",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, rep)
+}
+
+func isolationNote(tier string) string {
+	if tier == runtime.TierMicroVM {
+		return "dedicated guest kernel per sandbox"
+	}
+	return "sandbox shares this host's kernel: suitable for trusted or semi-trusted workloads, NOT for running arbitrary untrusted code"
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
@@ -241,13 +306,14 @@ func (s *Server) deleteSandbox(w http.ResponseWriter, r *http.Request) {
 // ---- exec & files ---------------------------------------------------------------
 
 type execBody struct {
-	Argv      []string          `json:"argv,omitempty"`
-	Command   string            `json:"command,omitempty"`
-	Env       map[string]string `json:"env,omitempty"`
-	User      string            `json:"user,omitempty"`
-	WorkDir   string            `json:"workdir,omitempty"`
-	TimeoutMs int               `json:"timeout_ms,omitempty"`
-	MaxOutput int               `json:"max_output,omitempty"`
+	Argv           []string          `json:"argv,omitempty"`
+	Command        string            `json:"command,omitempty"`
+	Env            map[string]string `json:"env,omitempty"`
+	User           string            `json:"user,omitempty"`
+	WorkDir        string            `json:"workdir,omitempty"`
+	TimeoutMs      int               `json:"timeout_ms,omitempty"`
+	MaxOutput      int               `json:"max_output,omitempty"`
+	IdempotencyKey string            `json:"idempotency_key,omitempty"`
 }
 
 func (s *Server) exec(w http.ResponseWriter, r *http.Request) {
@@ -273,7 +339,7 @@ func (s *Server) exec(w http.ResponseWriter, r *http.Request) {
 		Timeout:   time.Duration(body.TimeoutMs) * time.Millisecond,
 		MaxOutput: body.MaxOutput,
 	}
-	res, err := s.Svc.Exec(r.Context(), tn.ID, key.ID, r.PathValue("id"), req)
+	res, err := s.Svc.Exec(r.Context(), tn.ID, key.ID, r.PathValue("id"), req, body.IdempotencyKey)
 	if err != nil {
 		s.writeError(w, r, err)
 		return
@@ -479,4 +545,25 @@ func (s *Server) listEvents(w http.ResponseWriter, r *http.Request) {
 		out = []*domain.AuditEvent{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"events": out})
+}
+
+// ---- metering ---------------------------------------------------------------------
+
+// listMetering serves per-tenant usage. A tenant key is scoped to its own
+// tenant; an admin key may name one tenant with ?tenant= or omit it to get the
+// whole fleet. Usage is a monotonic lifetime counter — a billing system diffs
+// two snapshots rather than asking for a window.
+func (s *Server) listMetering(w http.ResponseWriter, r *http.Request) {
+	key := keyFrom(r)
+	tenantID := ""
+	if key != nil && key.Scope == domain.ScopeTenant {
+		tenantID = key.TenantID
+	} else {
+		tenantID = r.URL.Query().Get("tenant")
+	}
+	out := s.Svc.Metering(tenantID)
+	if out == nil {
+		out = []*domain.Usage{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"usage": out})
 }

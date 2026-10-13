@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"sandcastle.dev/sandcastle/internal/apperr"
 	"sandcastle.dev/sandcastle/internal/config"
 	"sandcastle.dev/sandcastle/internal/domain"
 	"sandcastle.dev/sandcastle/internal/metrics"
@@ -76,7 +77,11 @@ type fakeBackendForAPI struct {
 
 func newFakeBackendForAPI() *fakeBackendForAPI { return &fakeBackendForAPI{} }
 
-func (f *fakeBackendForAPI) Name() string                   { return "fake" }
+func (f *fakeBackendForAPI) Name() string          { return "fake" }
+func (f *fakeBackendForAPI) IsolationTier() string { return runtime.TierContainer }
+func (f *fakeBackendForAPI) VerifyIsolation(ctx context.Context, image string) (*runtime.IsolationReport, error) {
+	return nil, apperr.Unimpl("fake backend cannot verify isolation")
+}
 func (f *fakeBackendForAPI) Ping(ctx context.Context) error { return nil }
 func (f *fakeBackendForAPI) Create(ctx context.Context, req runtime.CreateRequest) (string, error) {
 	f.mu.Lock()
@@ -124,5 +129,8 @@ func (f *fakeBackendForAPI) ImportRootfs(ctx context.Context, dir, tag string) (
 	return tag, 1, nil
 }
 func (f *fakeBackendForAPI) Orphans(ctx context.Context) ([]runtime.Orphan, error) {
+	return nil, nil
+}
+func (f *fakeBackendForAPI) ManagedImages(ctx context.Context) ([]string, error) {
 	return nil, nil
 }

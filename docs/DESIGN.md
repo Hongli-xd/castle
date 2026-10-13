@@ -41,7 +41,7 @@ pi agent / SDK / CLI / 任意 HTTP 客户端
 |---|---|---|
 | Tenant | `tnt_` | 租户=计费/配额/审计边界。含 name、quota、status |
 | APIKey | `ak_` | 仅落库 SHA-256 哈希；含 prefix(前 12 字符用于查找)、scope(admin/tenant)、过期时间；可吊销 |
-| Sandbox | `sbx_` | 核心对象，含 Spec（cpu/mem/disk/timeout/egress/env/metadata）、state、node 信息 |
+| Sandbox | `sbx_` | 核心对象，含 Spec（cpu/mem/disk/timeout/egress/env/metadata）、state、backend ref。**没有 node 字段**——本版本是单节点进程，多节点调度需要先改数据模型 |
 | Snapshot | `snp_` | 由沙箱 commit 而来：rootfs 差分层 + 元数据；可派生新沙箱 |
 | Template | `tpl_` | 模板=镜像产物引用 + 默认 Spec；预热池按键 (tenant,template) 维护 |
 | AuditEvent | `evt_` | 追加式审计/生命周期事件；租户只能读自己的，admin 读全部 |
@@ -85,7 +85,9 @@ provisioning → running → pausing → paused → resuming → running
 
 ### 3.3 执行与文件
 - `POST /v1/sandboxes/{id}/exec`：同步执行（argv 或 shell 串），可设 cwd/env/user/
-  timeout_ms；返回 exit_code/stdout/stderr/耗时/是否截断；输出默认 1MiB 截断（防 OOM）。
+  timeout_ms；返回 exit_code/stdout/stderr/耗时/是否截断。`max_output` 是**上限**：
+  默认 1MiB，平台硬顶 `max_exec_output_bytes`（默认 8MiB），超出在准入处即被拒绝
+  （控制面把这些字节缓冲在自己的堆上，无上限的请求字段等于让人远程决定我们的内存占用）。
 - 文件 API：上传（base64 或原始体）、下载、列表、删除；路径校验拒绝越界（`..`、绝对
   路径逃逸）；单文件默认 100MiB 上限。
 
@@ -101,12 +103,129 @@ provisioning → running → pausing → paused → resuming → running
   属于 firecracker 后端路线图；
 - 未知模式：创建被拒绝（invalid_request），绝不静默降级。
 
-### 3.6 运维面
-- `GET /healthz`（存活）/ `GET /readyz`（就绪：store+backend 探测）/ `GET /metrics`
-  （Prometheus 文本格式，stdlib 手写）。
+### 3.6 隔离等级（必须显式声明，且不可静默降级）
+
+隔离强度**不是**一个部署细节，而是产品对客户的核心承诺，因此它是一个一等公民配置项：
+
+| 等级 | 值 | 内核 | 适用对象 |
+|---|---|---|---|
+| 容器（当前唯一可用） | `container-shared-kernel` | **与宿主共享** | 可信 / 半可信租户 |
+| microVM（路线图，本版本不可用） | `microvm` | 每沙箱独立 guest kernel | 任意不可信代码 |
+
+- `isolation = auto`（默认）：使用本机真正能跑的最强后端，并把**实际**等级写进启动日志；
+- `isolation = container`：明确接受共享内核这一档；
+- `isolation = microvm`：**要求**强隔离。本机不具备（无 `/dev/kvm`）或驱动仍是骨架时，
+  **拒绝启动**，而不是记一条 warning 然后继续用容器跑。这是本设计的硬约束：
+  一个"以为自己在跑 microVM、实际在跑共享内核容器"的部署，比明说"我只有容器"危险得多。
+
+运行中的等级是**机器可读**的：`GET /readyz` 返回 `.isolation` 与 `.isolation_note`，
+无需认证（唯一的例外，因为客户最需要能独立核对的就是这一项）。
+
+`internal/runtime.Backend` 接口带 `IsolationTier()` 方法，所以新增后端**必须**声明自己的等级——
+这条信息不可能再被漏掉。
+
+#### 3.6.1 容器级隔离契约：字段钉死 + userns + 自检
+
+等级说清了"这一档有多强"，这一节说清"这一档具体做了什么"。
+
+**（一）安全契约写在创建请求里，不写在宿主 `daemon.json` 里。**
+凡是没有显式写入 `HostConfig` 的字段，都由宿主的 `daemon.json` 决定 —— 那是一个可变的文件，
+换一个引擎版本或换一个运维就能改，而这份代码不会有任何变化。因此每一个沙箱依赖的字段都被显式
+写出，**即使它的值恰好等于今天的引擎默认值**：
+
+| 字段 | 钉死为 | 若不钉死会怎样 |
+|---|---|---|
+| `NetworkMode` | `none` | 沙箱获得网络 |
+| `IpcMode` | `private` | `default-ipc-mode` 默认 `shareable`，别的容器可加入本沙箱的 IPC 命名空间 |
+| `CgroupnsMode` | `private` | `default-cgroupns-mode` 在 cgroup v1 上默认 `host` |
+| `UsernsMode` | `private` 或 `host`（**永不省略**） | 见下（二） |
+| `Privileged` | `false` | — |
+| `CapDrop` / `CapAdd` | `ALL` / `[]` | 空 `CapAdd` 也显式写出：未设置的字段是引擎可以填的字段 |
+| `SecurityOpt` | `no-new-privileges` + `apparmor=docker-default` | `seccomp-profile` 可被 daemon 级替换 |
+| `MaskedPaths` / `ReadonlyPaths` | 引擎默认集合的显式副本 | 屏蔽集合可随引擎版本变化 |
+| `Ulimits` | `core=0/0`、`nofile=1024/65536` | 见下（四） |
+| `ReadonlyRootfs` | `false`（**刻意**，非遗漏） | 见下（四） |
+| `Resources` | CPU/内存/关闭 swap/PidsLimit | 单沙箱耗尽宿主机资源 |
+
+`apparmor=` 只在 `/info` 报告存在 AppArmor 时才写：在没有 AppArmor 的宿主上指定 profile 是错误。
+
+**（二）user namespace 是一个会静默失效的设置。**
+实测（Docker 29.5.2，未配置 `userns-remap`）：把 `HostConfig.UsernsMode` 设为 `private`，
+
+```
+GET /containers/<id>/json → HostConfig.UsernsMode = "private"   ← 引擎原样回读
+/proc/self/uid_map        → 0 0 4294967295                      ← 什么都没发生
+```
+
+引擎接受了它无法兑现的字段并回读为"已应用"。因此**读配置（哪怕是从引擎回读的配置）都不是证据**，
+只有内核报告的 uid 映射才是。据此：
+
+- `userns = auto`（默认）：从 `/info` 的 `SecurityOptions` 判断本 daemon 是否真的具备 remap 能力，
+  具备则用 `private`，否则运行在 `host` 并把这次降级**写进启动日志与 `/readyz`**；
+- `userns = require`：不具备时**拒绝启动**，报错信息点名 `userns-remap` / `daemon.json` / `userns=off`
+  三条出路；
+- `userns = off`：显式接受共享身份这一档（启动打印 WARNING）。
+
+`UsernsMode` 永不省略。留空不是中性的：配了 `userns-remap` 的引擎会把新容器默认设为 `private`，
+于是同一个"未设置"在某些宿主上是 `private`、在另一些上是 `host` —— 那样 `userns=off` 就无法真正关闭它。
+
+没有用户命名空间时，沙箱内的 uid 0 **就是**宿主的 uid 0：一个内核漏洞直接到达宿主 root，
+不需要第二次提权，上面那些控制（drop capabilities、seccomp、LSM）在被越过的那一刻就全部失效。
+这一层是"压缩逃逸收益"，与其余几层"缩小入口"不同。
+
+**（三）隔离必须可被证明，而不是被声明。**
+`internal/runtime.Backend` 带 `VerifyIsolation()`：用**生产同一条载荷路径**起一个真沙箱，
+在里面读内核事实（`/proc/self/uid_map`、`Seccomp`、`NoNewPrivs`、`CapEff/CapBnd`、
+`/proc/self/attr/current`、`ulimit -c`），并尝试两个逃逸探针（`mount`、读 `/proc/kcore`）。
+因为 `IsolationTier()` 只声明等级，`VerifyIsolation()` 才证明等级。
+
+结果有三种，且**不允许互相冒充**：
+
+| 结果 | 含义 |
+|---|---|
+| 全项通过 | 逐项列出实测值 |
+| 有项失败 | 逐项列出 `observed` 与 `want` |
+| **无法测量** | 探针没跑起来 / 探针与解析器对不上键 → 返回错误 |
+
+第三种尤其重要：一个测不出结果的检查，既不能报"通过"，也不能报"发现漏洞"。
+启动时执行一次，结果缓存在 `GET /readyz`（摘要，不鉴权）与 `GET /v1/isolation`（完整证据，需 admin）。
+`/readyz` 在自检从未运行时返回 `isolation_verified: false` 并说明"这是配置，不是已验证的事实"，**
+绝不会把"未验证"渲染成成功**。
+
+**（四）两处与快照语义耦合的决定。**
+- `core=0`：本产品会把沙箱文件系统 `Commit()` 成快照，因此一次 core dump 会把进程内存
+  ——包括它持有的凭据——写进一个会被存储并分发给其他沙箱的产物里。这是数据外泄控制，不是整洁性设置。
+- `ReadonlyRootfs=false`：只读根目录是通常的下一步加固，但它与快照模型不兼容 ——
+  `Commit()` 捕获的是容器的可写层，只读根会产出空快照。要与"可写 workspace overlay"一起重新设计，
+  在此之前不假装拥有它。
+
+### 3.7 运维面
+- `GET /healthz`（存活）/ `GET /readyz`（就绪：store+backend 探测，并回报隔离等级与自检摘要）/
+  `GET /v1/isolation`（完整隔离自检证据，需 admin）/ `GET /metrics`（Prometheus 文本格式，stdlib 手写）。
+  `/healthz` 与 `/readyz` 不鉴权（负载均衡需要）；`/metrics` 与 `/v1/isolation` 需要 **admin scope**——
+  它们承载全租户的运维数据与当前生效的控制清单，后者对正在策划逃逸的人就是侦察情报。
 - 结构化 JSON 日志（request_id 贯穿）、优雅停机、`SIGHUP` 日志级别热调。
 - 配置：TOML-lite（自解析 key=value）文件 + 环境变量覆盖 + 命令行。
+  数值型环境变量解析失败即启动失败，**不**静默回退默认值。
 - 请求体上限 1MiB（文件上传除外）、ReadHeaderTimeout 防 slowloris、并发连接上限。
+- exec 输出上限 `max_exec_output_bytes`（默认 8MiB）。请求里的 `max_output` 是**上限**
+  而非偏好：控制面把这些字节缓冲在自己的堆上，0 表示后端默认（1MiB），**不**表示"无限"。
+- 未认证流量按客户端 IP 设防洪阈值（`preauth.*`）。它位于认证**之前**，因为未认证的
+  调用者还谈不上租户配额；且刻意不看 `X-Forwarded-For`（该头可伪造）。
+- 认证失败审计按 IP 分窗聚合（首次全量记录 + 每 100 次记一次计数），
+  所以未认证洪泛不会变成"每请求一次 fsync"。指标 `sandboxd_auth_failures_total`
+  **不做采样**，真实总量始终可见。
+
+### 3.8 WAL 损坏恢复（区分"崩溃残骸"与"已确认数据"）
+
+| 损坏位置 | 判定 | 默认动作 |
+|---|---|---|
+| 日志尾部（写入中途掉电） | 该帧本就不是已提交事务 | 自动截断，记 `RepairReport` |
+| 日志中段（其后仍有完好帧） | 那些帧已 fsync 并被确认 | **拒绝启动**，要求人工决定 |
+
+`wal_repair = salvage` 是在首个坏帧处截断的显式逃生舱；`strict` 则连尾部撕裂也不自动修。
+三种策略都会产出量化的 `RepairReport`（损坏类型/偏移/保留与丢弃的字节数），
+经启动日志暴露——**不存在静默丢数据的路径**。
 
 ## 4. API 面（REST，`/v1`）
 
@@ -150,21 +269,42 @@ CVE-2026-25253）+ **持有租户 Key 的调用方**。
 - **WAL 存储层**：每事务一帧 `[len][crc32][payload]`，写后 fsync；重启重放；尾部残帧
   CRC 检出即截断（崩溃原子性）；周期压实（全量重写+截断日志）；数据目录丢失=不可恢复
   （有文档的备份指引：copy 数据目录即可）。
-- **崩溃恢复**：过渡态对账（见 §2）；后端容器孤儿回收（带产品标签的容器按标签收割）。
+- **崩溃恢复**：过渡态对账（见 §2）；后端容器孤儿回收（带产品标签的容器按标签收割）；
+  **孤儿镜像回收**——快照/模板镜像带标签（`sandboxd-snap-<id>`），因此**不是**悬空镜像，
+  `docker image prune` 永远不会删它们。数据目录丢失、从提交前的备份恢复、或节点重建时，
+  镜像会没有记录指向它并永久留在盘上。reconciler 的镜像遍历是唯一会删它们的东西，
+  它保护任何仍被记录引用的镜像（含**从快照创建的活沙箱**所用的镜像）。见
+  `TestOrphanedSnapshotImagesAreReaped`。
 - **背压**：创建并发闸（全局信号量）+ 预热池吸收突发。
 
 ## 7. 测试与验收（商用门槛）
+
+全部端到端断言位于 `tests/` 下的 Go 套件，共用一个 harness（daemon 生命周期、带类型客户端与
+沙箱夹具）。harness 复用生产侧的 `internal/domain` 类型，字段改名会在编译期报错而不是在运行时
+静默漏测；断言辅助函数把结果分成"通过 / 失败 / 测不出来"三种，且不允许互相冒充。
 
 1. 单元：存储崩溃语义（撕裂帧/并发 CAS/压实）、状态机全部非法转换、配额/限流边界、
    路径穿越、Key 哈希；`-race` 全绿。
 2. 集成（真实 Docker）：创建→exec→文件→快照→从快照重建→暂停→恢复→停止全链路；
    资源限制真实生效验证；离线 rootfs 导入（不依赖 registry）。
 3. API 黑盒：未认证/错租户访问/越权 IDOR/超配额/超限流 429/畸形请求——全部得到预期
-   错误码且无信息泄漏。
-4. 混沌：daemon 执行中 `kill -9` → 重启对账收敛；存储目录权限损坏时的失败模式；
-   后端不可达时的降级表现。
-5. 负载：50 并发创建/exec 混合负载，P99 与错误率达标（0 5xx、限流器工作正常）。
-6. Agent 实战：pi 扩展端到端——pi 的 bash/read/write 工具实际落在沙箱内执行。
+   错误码且无信息泄漏；错误包络的 `code` 是客户端唯一应分支的字段。
+4. 隔离契约：22 项从**运行中沙箱内部**读取的内核事实（seccomp / NoNewPrivs / 能力集 /
+   `/proc/self/uid_map` / ulimit / 设备 / 套接字 / 路由），并断言 daemon 自己的启动自检
+   与本套件结论一致。
+5. 遏制：OOM 上限、fork 炸弹、CPU 独占、`rm -rf /` 爆炸半径、沙箱内写"宿主路径"——
+   每一项都带**正向对照**（先证明恶意载荷真的执行并生效），否则"没出事"可能只是"没发生"。
+6. 混沌与灾难：daemon 执行中 `kill -9` → 重启对账收敛；重复崩溃的 WAL 完整性；
+   备份/时点恢复；孤儿后端对象与孤儿快照镜像的回收。
+7. 并发与多租户：并发创建的归属、并发 exec 的输出不串、租户间文件系统不共享、
+   配额在并发下的真实语义（收敛而非瞬时精确，见 SECURITY-CONTRACT.md §5）。
+8. 负载：并发创建 + 200 次混合 exec，零 5xx，P50/P99 实测记录在测试日志中。
+9. Agent 实战：pi 扩展端到端——pi 的 `bash` 工具实际落在沙箱内执行；read/write/edit 仍在宿主（本产品是**执行隔离**而非 **Agent 隔离**，边界见 integrations/pi/pi-sbx/README.md 范围声明）。
+
+验收门槛：以上全部通过，且 `SBX_REQUIRE_DOCKER=1` 下**不允许出现静默跳过**——
+一个静默跳过的套件与一个通过的套件在报告上无法区分。
+
+客户可核对的逐层承诺与**明确不承诺**的边界见 [SECURITY-CONTRACT.md](SECURITY-CONTRACT.md)。
 
 ## 7.5 v1.1 路线图（吸收 DSec，arXiv:2609.22978）
 

@@ -6,9 +6,13 @@ package service
 
 import (
 	"context"
+	"fmt"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
+	"sandcastle.dev/sandcastle/internal/apperr"
 	"sandcastle.dev/sandcastle/internal/config"
 	"sandcastle.dev/sandcastle/internal/domain"
 	"sandcastle.dev/sandcastle/internal/gov"
@@ -27,11 +31,17 @@ type Service struct {
 	Cfg     *config.Config
 	Reg     *metrics.Registry
 
+	meter   *meter
+	idem    *idemRegistry
+	meterWG sync.WaitGroup
+
 	createSem    chan struct{}
 	poolMu       sync.Mutex
 	pool         map[string][]poolItem // imageRef → warm items
 	activityMu   sync.Mutex
 	activitySeen map[string]time.Time // sandboxID → last persisted activity flush
+	isoMu        sync.Mutex
+	isoReport    *runtime.IsolationReport // last self-check; nil until it has run
 	stopCh       chan struct{}
 	stopOnce     sync.Once
 }
@@ -46,6 +56,8 @@ func New(st *store.Store, backend runtime.Backend, cfg *config.Config, reg *metr
 		Audit:        gov.NewAudit(st),
 		Cfg:          cfg,
 		Reg:          reg,
+		meter:        newMeter(st),
+		idem:         newIdemRegistry(0, 0),
 		createSem:    make(chan struct{}, cfg.MaxConcurrentCreates),
 		activitySeen: map[string]time.Time{},
 		stopCh:       make(chan struct{}),
@@ -59,13 +71,28 @@ func (s *Service) StartLoops() {
 	go s.sweepLoop()
 	go s.reconcileLoop()
 	go s.compactLoop()
+	if s.Cfg.MeterEvery > 0 {
+		s.meterWG.Add(1)
+		go func() {
+			defer s.meterWG.Done()
+			s.meterLoop()
+		}()
+	}
 	if s.Cfg.PoolEnabled && s.Cfg.PoolSize > 0 {
 		go s.poolLoop()
 	}
 }
 
 func (s *Service) Stop() {
-	s.stopOnce.Do(func() { close(s.stopCh) })
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+		// The meter loop flushes its in-memory tail before exiting; wait for
+		// it so a graceful shutdown never drops the last metering interval.
+		s.meterWG.Wait()
+		// The limiter owns a sweeper goroutine; stopping only the service's
+		// own loops would leave it running against a discarded bucket table.
+		s.Limiter.Stop()
+	})
 }
 
 func (s *Service) Limits() domain.Limits { return s.Cfg.Limits }
@@ -97,6 +124,9 @@ func (s *Service) CreateSandbox(ctx context.Context, tenant *domain.Tenant, key 
 	}
 	spec := mergeSpec(defaults, req.Spec, s.Cfg)
 	if err := spec.Validate(s.Cfg.Limits, 0); err != nil {
+		return nil, err
+	}
+	if err := s.validateMounts(spec); err != nil {
 		return nil, err
 	}
 	if err := validateMetadata(req.Metadata, s.Cfg.Limits); err != nil {
@@ -240,17 +270,89 @@ func mergeSpec(defaults *domain.SandboxSpec, req domain.SandboxSpec, cfg *config
 	if req.TimeoutSeconds != 0 {
 		out.TimeoutSeconds = req.TimeoutSeconds
 	}
+	// IdleTimeoutSeconds needs the same override every other field here has.
+	// It was the one field with a default-fill above and no matching `req`
+	// branch, so spec.idle_timeout_seconds was validated against the platform
+	// limits, accepted with a 201, echoed in docs/API.md as a settable knob,
+	// and then silently discarded — the stored spec always carried the platform
+	// default. Per-sandbox idle reclamation was therefore unreachable, and the
+	// failure mode was the worst kind: no error, no log, and a 201.
+	//
+	// Found by tests/commercial_test.go TestElasticityIdleReclaimIsActivityDriven,
+	// which is also the end-to-end regression test for it: it sets the field on
+	// one sandbox and asserts the reclaim, so it fails if this line is ever lost
+	// again.
+	if req.IdleTimeoutSeconds != 0 {
+		out.IdleTimeoutSeconds = req.IdleTimeoutSeconds
+	}
 	if req.User != "" {
 		out.User = req.User
 	}
 	if req.WorkDir != "" {
 		out.WorkDir = req.WorkDir
 	}
+	// Mounts need the same override branch as every field here. Without it the
+	// request's mounts are silently dropped in favour of the template default
+	// (usually none), so a tenant's allowlisted mount never reaches the
+	// backend — the same silent-discard class that bit idle_timeout_seconds in
+	// v1.1.5. A non-empty request list fully replaces the default, matching
+	// Env's semantics; an empty request list inherits the template default.
+	if len(req.Mounts) > 0 {
+		out.Mounts = req.Mounts
+	}
 	if len(req.Env) > 0 {
 		out.Env = req.Env
 	}
 	if req.Egress.Mode != "" {
 		out.Egress = req.Egress
+	}
+	return out
+}
+
+// validateMounts gates read-only host mounts against the operator's
+// allowlist. Mounts are opt-in and default off: an empty allowlist rejects
+// every mount, which keeps the "no host directory is mounted" canary true by
+// default. The shape of each mount was already checked by SandboxSpec.Validate;
+// this is the *authorization* half that needs the operator's configuration.
+func (s *Service) validateMounts(spec domain.SandboxSpec) error {
+	if len(spec.Mounts) == 0 {
+		return nil
+	}
+	if len(s.Cfg.MountAllowlist) == 0 {
+		return apperr.ForbiddenErr("host mounts are disabled: the operator has configured no mount.allow entries")
+	}
+	for _, m := range spec.Mounts {
+		if !s.mountAllowed(m.Source) {
+			return apperr.New(apperr.Forbidden,
+				fmt.Sprintf("host mount %q is outside the operator's mount.allow allowlist", m.Source))
+		}
+	}
+	return nil
+}
+
+// mountAllowed reports whether src is an allowlisted host path or lives under
+// one. Paths are cleaned before comparison so "/a/../b" and "/b" compare
+// equal, and the trailing-separator test prevents "/app" from allowing "/apple".
+func (s *Service) mountAllowed(src string) bool {
+	src = filepath.Clean(src)
+	for _, a := range s.Cfg.MountAllowlist {
+		a = filepath.Clean(a)
+		if src == a || strings.HasPrefix(src, a+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// runtimeMounts lifts domain mount specs into the backend request. The runtime
+// Mount type is read-only by construction, so this is a straight copy.
+func runtimeMounts(in []domain.MountSpec) []runtime.Mount {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]runtime.Mount, 0, len(in))
+	for _, m := range in {
+		out = append(out, runtime.Mount{Source: m.Source, Target: m.Target})
 	}
 	return out
 }
@@ -282,6 +384,7 @@ func (s *Service) provision(sbID, imageRef string) {
 		Env:           cur.Spec.Env,
 		User:          cur.Spec.User,
 		WorkDir:       cur.Spec.WorkDir,
+		Mounts:        runtimeMounts(cur.Spec.Mounts),
 		Labels: map[string]string{
 			"sandbox.id":     sbID,
 			"sandbox.tenant": cur.TenantID,
@@ -365,8 +468,10 @@ func (s *Service) waitForState(ctx context.Context, id string, maxWait time.Dura
 }
 
 func (s *Service) recordCreateMetrics(source string) {
-	s.Reg.Counter("sandboxd_creates_total", "sandbox creates by source", []string{"source"}, 1)
-	_ = source
+	// The value was in hand all along; v1.1.0 passed only the label NAME and
+	// then discarded the value with `_ = source`, so the series rendered as
+	// sandboxd_creates_total{} and every create collapsed into one number.
+	s.Reg.Counter("sandboxd_creates_total", "sandbox creates by source", []string{"source", source}, 1)
 }
 
 func sanitize(s string) string {

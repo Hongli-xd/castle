@@ -4,3 +4,4 @@ data/
 node_modules/
 *.conf
 !sandboxd.conf.example
+.DS_Store

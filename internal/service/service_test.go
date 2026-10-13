@@ -25,6 +25,7 @@ type fakeObj struct {
 	labels         map[string]string
 	files          map[string][]byte
 	dirs           map[string]bool
+	mounts         []runtime.Mount
 	reclaimedLimit int64 // nonzero while pause-time reclaim is emulated
 	originalLimit  int64
 }
@@ -44,6 +45,18 @@ type fakeBackend struct {
 
 	failCreate error
 	failStart  error
+
+	// onRemove, when set, runs inside Remove while the backend lock is held.
+	// It lets a test simulate a concurrent bookkeeping write (touchActivity /
+	// reconciler / sweeper) that lands while the delete's backend removal is
+	// still in flight — the exact window the delete CAS bug lived in.
+	onRemove func()
+
+	// execCalls counts Exec invocations so idempotency tests can prove a
+	// replayed call never reaches the backend. execBlock, when set, makes Exec
+	// wait so single-flight tests can hold concurrent callers in flight.
+	execCalls int
+	execBlock chan struct{}
 }
 
 func newFakeBackend() *fakeBackend {
@@ -53,7 +66,17 @@ func newFakeBackend() *fakeBackend {
 	}
 }
 
-func (f *fakeBackend) Name() string { return "fake" }
+func (f *fakeBackend) Name() string          { return "fake" }
+func (f *fakeBackend) IsolationTier() string { return runtime.TierContainer }
+
+// VerifyIsolation reports "not applicable" rather than an empty report: a
+// report with no facts would read as a clean bill of health, which for a fake
+// backend is precisely the kind of false assurance the real check exists to
+// eliminate.
+func (f *fakeBackend) VerifyIsolation(ctx context.Context, image string) (*runtime.IsolationReport, error) {
+	return nil, apperr.Unimpl("fake backend cannot verify isolation")
+}
+
 func (f *fakeBackend) Ping(ctx context.Context) error {
 	return nil
 }
@@ -66,7 +89,7 @@ func (f *fakeBackend) Create(ctx context.Context, req runtime.CreateRequest) (st
 	}
 	f.seq++
 	ref := fmt.Sprintf("sandboxd-%s-%d", trimSBX(req.Name), f.seq)
-	o := &fakeObj{labels: req.Labels, files: map[string][]byte{}, dirs: map[string]bool{}}
+	o := &fakeObj{labels: req.Labels, files: map[string][]byte{}, dirs: map[string]bool{}, mounts: req.Mounts}
 	// restoring from a committed image carries its filesystem in
 	if img, ok := f.images[req.Image]; ok {
 		for p, c := range img.files {
@@ -174,6 +197,9 @@ func (f *fakeBackend) Remove(ctx context.Context, ref string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.objects, ref)
+	if f.onRemove != nil {
+		f.onRemove()
+	}
 	return nil
 }
 
@@ -202,9 +228,14 @@ func (f *fakeBackend) Inspect(ctx context.Context, ref string) (runtime.Status, 
 func (f *fakeBackend) Exec(ctx context.Context, ref string, req runtime.ExecRequest) (*runtime.ExecResult, error) {
 	f.mu.Lock()
 	_, ok := f.objects[ref]
+	f.execCalls++
+	block := f.execBlock
 	f.mu.Unlock()
 	if !ok {
 		return nil, apperr.NotFoundErr("container")
+	}
+	if block != nil {
+		<-block
 	}
 	return &runtime.ExecResult{ExitCode: 0, Stdout: []byte("fake"), Duration: time.Millisecond}, nil
 }
@@ -321,6 +352,24 @@ func (f *fakeBackend) Orphans(ctx context.Context) ([]runtime.Orphan, error) {
 	var out []runtime.Orphan
 	for ref, o := range f.objects {
 		out = append(out, runtime.Orphan{Ref: ref, Labels: o.labels, Status: o.status})
+	}
+	return out, nil
+}
+
+// ManagedImages mirrors the real backend's reference filter, so a reconciler
+// test can prove the image pass distinguishes an orphan from an image a live
+// sandbox still needs.
+func (f *fakeBackend) ManagedImages(ctx context.Context) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for tag := range f.images {
+		for _, p := range []string{"sandboxd-snap-", "sandboxd-tpl-"} {
+			if strings.HasPrefix(tag, p) {
+				out = append(out, tag)
+				break
+			}
+		}
 	}
 	return out, nil
 }
@@ -475,6 +524,84 @@ func TestSuspendedTenantRejected(t *testing.T) {
 	}
 }
 
+// TestMountsAreAllowlistGated pins the security boundary the whole read-only
+// mount feature exists to preserve: a tenant must never be able to bind an
+// arbitrary host path, even read-only, because that is reading the node. An
+// empty allowlist (the default) must reject every mount so the isolation
+// contract's "no host directory is mounted" canary stays true out of the box.
+func TestMountsAreAllowlistGated(t *testing.T) {
+	h := newHarness(t)
+	_, err := h.svc.CreateSandbox(context.Background(), h.tn, h.key, CreateRequest{
+		TemplateID: "tpl_" + findTemplate(t, h.st),
+		Spec: domain.SandboxSpec{
+			Mounts: []domain.MountSpec{{Source: "/srv/proj", Target: "/workspace"}},
+		},
+	})
+	if apperr.From(err).Code != apperr.Forbidden {
+		t.Fatalf("empty allowlist must refuse a mount; got %v", err)
+	}
+}
+
+// TestMountAllowlistPrefixBoundary guards the path-prefix comparison itself:
+// the trailing-separator rule is what stops "/srv/projects" from allowing
+// "/srv/project" — the classic one-character-then-slash sibling directory.
+func TestMountAllowlistPrefixBoundary(t *testing.T) {
+	h := newHarness(t)
+	h.svc.Cfg.MountAllowlist = []string{"/srv/projects"}
+	cases := []struct {
+		src string
+		ok  bool
+	}{
+		{"/srv/projects", true},
+		{"/srv/projects/app", true},
+		{"/srv/project", false},           // sibling with a shared prefix
+		{"/srv/projects-other", false},    // hyphen is not a separator
+		{"/etc", false},                   // unrelated
+		{"/srv/projects/../etc", false},   // cleaned to /srv/etc, not under
+	}
+	for _, c := range cases {
+		if got := h.svc.mountAllowed(c.src); got != c.ok {
+			t.Errorf("mountAllowed(%q) = %v, want %v", c.src, got, c.ok)
+		}
+	}
+}
+
+// TestCreatePassesMountsToBackend proves the allowlisted mount flows through
+// the whole control plane into the backend create request — the half the e2e
+// suite then verifies against a real container.
+func TestCreatePassesMountsToBackend(t *testing.T) {
+	h := newHarness(t)
+	h.svc.Cfg.MountAllowlist = []string{"/srv/projects"}
+	sb, err := h.svc.CreateSandbox(context.Background(), h.tn, h.key, CreateRequest{
+		TemplateID:  "tpl_" + findTemplate(t, h.st),
+		Wait:        true,
+		WaitTimeout: 10 * time.Second,
+		Spec: domain.SandboxSpec{
+			Mounts: []domain.MountSpec{{Source: "/srv/projects/app", Target: "/workspace"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("allowlisted mount must be accepted: %v", err)
+	}
+	// The stored spec persists the mount so crash recovery can re-create it.
+	if len(sb.Spec.Mounts) != 1 || sb.Spec.Mounts[0].Target != "/workspace" {
+		t.Fatalf("stored spec lost the mount: %+v", sb.Spec.Mounts)
+	}
+	// The backend saw exactly one read-only mount, source and target intact.
+	h.fb.mu.Lock()
+	obj := h.fb.objects[sb.Backend.Ref]
+	h.fb.mu.Unlock()
+	if obj == nil {
+		t.Fatalf("backend object %q not found", sb.Backend.Ref)
+	}
+	if len(obj.mounts) != 1 {
+		t.Fatalf("backend mounts = %+v, want exactly one", obj.mounts)
+	}
+	if obj.mounts[0].Source != "/srv/projects/app" || obj.mounts[0].Target != "/workspace" {
+		t.Fatalf("backend mount = %+v, want source /srv/projects/app target /workspace", obj.mounts[0])
+	}
+}
+
 func TestStartFailureConvergesToFailed(t *testing.T) {
 	h := newHarness(t)
 	h.fb.failStart = apperr.ConflictErr("simulated broken image")
@@ -530,7 +657,7 @@ func TestExecRequiresRunning(t *testing.T) {
 	if _, err := h.svc.PauseSandbox(context.Background(), h.tn.ID, h.key.ID, sb.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.svc.Exec(context.Background(), h.tn.ID, h.key.ID, sb.ID, runtime.ExecRequest{Argv: []string{"ls"}}); err != nil {
+	if _, err := h.svc.Exec(context.Background(), h.tn.ID, h.key.ID, sb.ID, runtime.ExecRequest{Argv: []string{"ls"}}, ""); err != nil {
 		t.Fatalf("transparent resume failed: %v", err)
 	}
 	got, _ := h.st.GetSandbox(sb.ID)
@@ -545,14 +672,14 @@ func TestExecRequiresRunning(t *testing.T) {
 	if _, err := h2.svc.PauseSandbox(context.Background(), h2.tn.ID, h2.key.ID, sb2.ID); err != nil {
 		t.Fatal(err)
 	}
-	_, err := h2.svc.Exec(context.Background(), h2.tn.ID, h2.key.ID, sb2.ID, runtime.ExecRequest{Argv: []string{"ls"}})
+	_, err := h2.svc.Exec(context.Background(), h2.tn.ID, h2.key.ID, sb2.ID, runtime.ExecRequest{Argv: []string{"ls"}}, "")
 	if apperr.From(err).Code != apperr.Conflict {
 		t.Fatalf("auto_resume=false must keep the 409, got %v", err)
 	}
 	if _, err := h2.svc.ResumeSandbox(context.Background(), h2.tn.ID, h2.key.ID, sb2.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h2.svc.Exec(context.Background(), h2.tn.ID, h2.key.ID, sb2.ID, runtime.ExecRequest{Argv: []string{"ls"}}); err != nil {
+	if _, err := h2.svc.Exec(context.Background(), h2.tn.ID, h2.key.ID, sb2.ID, runtime.ExecRequest{Argv: []string{"ls"}}, ""); err != nil {
 		t.Fatalf("exec on running: %v", err)
 	}
 }
@@ -889,5 +1016,74 @@ func TestDeleteRequiresForceWhenActive(t *testing.T) {
 	}
 	if len(h.fb.objects) != 0 {
 		t.Fatal("backend object survived delete")
+	}
+}
+
+// TestDeleteSurvivesConcurrentVersionBump reproduces the race that
+// TestNoBackendLeaks caught live: a bookkeeping write (touchActivity, the
+// reconciler, or the sweeper — all of which bump Version even with
+// baseVersion=-1) lands between the delete's loadOwned and its record removal.
+// The backend removal happens in between, so the container is already gone by
+// the time the record write runs. Guarding that write with sb.Version turned
+// the bump into a 409 "modified concurrently" — a spurious conflict delivered
+// after the destructive step. Delete is terminal and idempotent; a concurrent
+// bump must not block it.
+func TestDeleteSurvivesConcurrentVersionBump(t *testing.T) {
+	h := newHarness(t)
+	sb := h.create(t, true)
+
+	// Bump the sandbox's version from inside the backend Remove call: this is
+	// the same instant the real bug's bump lands (while the container teardown
+	// is in flight, after DeleteSandbox already read the record).
+	h.fb.onRemove = func() {
+		if _, err := h.st.UpdateSandbox(sb.ID, -1, func(x *domain.Sandbox) error {
+			x.LastActivityAt = time.Now().UTC()
+			return nil
+		}); err != nil {
+			t.Errorf("simulated bookkeeping bump: %v", err)
+		}
+	}
+
+	if err := h.svc.DeleteSandbox(context.Background(), h.tn.ID, h.key.ID, sb.ID, true); err != nil {
+		t.Fatalf("forced delete must survive a concurrent bookkeeping bump, got %v", err)
+	}
+	if _, ok := h.st.GetSandbox(sb.ID); ok {
+		t.Fatal("record survived delete")
+	}
+	if len(h.fb.objects) != 0 {
+		t.Fatal("backend object survived delete")
+	}
+}
+
+// TestDeleteIsIdempotentAcrossConcurrentDeletes: two forced deletes of the same
+// sandbox race. Neither caller may surface a conflict — the bug's symptom — and
+// the sandbox must end up gone. The loser may legitimately observe not_found
+// (its own loadOwned saw the winner's record removal first), which is the same
+// goal met; only a conflict is a regression.
+func TestDeleteIsIdempotentAcrossConcurrentDeletes(t *testing.T) {
+	h := newHarness(t)
+	sb := h.create(t, true)
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = h.svc.DeleteSandbox(context.Background(), h.tn.ID, h.key.ID, sb.ID, true)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if c := apperr.From(err); c != nil && c.Code == apperr.Conflict {
+			t.Fatalf("concurrent delete %d hit a conflict: %v", i, err)
+		}
+	}
+	if _, ok := h.st.GetSandbox(sb.ID); ok {
+		t.Fatal("record survived concurrent deletes")
+	}
+	if len(h.fb.objects) != 0 {
+		t.Fatal("backend object survived concurrent deletes")
 	}
 }

@@ -33,7 +33,92 @@ pause_reclaim = true
 # 会被拒绝。设为 false 表示你已理解并接受该风险（见 docs/THREAT-MODEL.md）。
 enforce_disk_quota = true
 
+# ── 只读宿主目录挂载（可选，默认关闭）─────────────────────────────────────
+# 逗号分隔的宿主目录白名单：只有列在这里的目录（或其子目录）才允许被沙箱以
+# 【只读】方式挂载。这是「沙箱读不到宿主文件」这条边界上的窄幅、显式例外——
+# 解决的是"bash 里看不到项目文件"的可用性，不是放开写边界：沙箱永远写不回宿主。
+# 留空（默认）＝ 完全禁止挂载，隔离契约里的 no_host_directory_is_mounted
+# 金丝雀保持默认通过。没有「可写挂载」这个选项——它会在类型层面被拒绝。
+# 对应 API 字段：spec.mounts = [{source, target}]；仅白名单内 source 被接受。
+# mount.allow = /Users/you/WorkBuddy,/srv/datasets
+# 环境变量等价项：SBXD_MOUNT_ALLOW（逗号分隔）
+
 # 首次启动自动播种默认模板所需的本机镜像（可选）
 # bootstrap.image = "alpine:3.22"
 # 运维轮换的管理员 Key（可选；缺省则首次启动生成并打印一次）
 # bootstrap_admin_key = "sk_..."
+
+# ── 隔离等级 ────────────────────────────────────────────────────────────────
+# auto      默认。使用本机真正能跑的最强后端，并把实际等级写进启动日志。
+# container 明确要求共享内核的容器后端。
+# microvm   明确要求 KVM microVM 后端。本机不具备时【拒绝启动】，绝不静默降级。
+#
+# 选 microvm 的意义就在于它无法悄悄退化成容器。运行中的等级随时可从
+# GET /readyz 的 .isolation 字段读取核对。
+# isolation = auto
+
+# ── user namespace（容器档最关键的一层）────────────────────────────────────
+# auto    （默认）本 daemon 真的具备 userns-remap 时启用；不具备则运行在 host
+#         模式，并把这次降级写进启动日志与 GET /readyz。
+# require 不具备时【拒绝启动】。多租户生产环境建议用这个。
+# off     显式接受共享身份这一档（启动打印 WARNING）。
+#
+# 为什么需要它：没有用户命名空间时，沙箱内的 uid 0 就是宿主的 uid 0，
+# 一个内核漏洞直接到达宿主 root，不需要第二次提权 —— drop capabilities、
+# seccomp、LSM 这些控制在被越过的那一刻就全部失效。
+#
+# 注意：这不是一个"设了就有"的开关。把 UsernsMode 设成 private 而 daemon 没有配
+# remap 时，引擎会接受并原样回读为 "private"，而沙箱仍然拿着 identity uid 映射
+# （实测 /proc/self/uid_map = 0 0 4294967295）。所以本程序是去读 daemon 自己的
+# /info 来判断能力，而不是请求它然后假定生效。
+# userns = auto
+
+# 隔离自检：启动时用生产同一条载荷路径起一个真沙箱，在里面读内核事实
+# （uid_map / Seccomp / NoNewPrivs / CapEff / LSM label / ulimit -c）并尝试
+# 两个逃逸探针（mount、读 /proc/kcore）。结果见启动日志、GET /readyz（摘要）
+# 与 GET /v1/isolation（完整证据，需 admin）。
+# bootstrap.image 同时也作为自检使用的镜像；留空则自动挑本机最小的带 tag 镜像。
+# 探针跑不起来时【不会】报通过：无法测量与测量后失败是两种不同结果。
+
+# ── exec 输出上限 ──────────────────────────────────────────────────────────
+# 单次 exec 捕获的 stdout+stderr 字节数硬上限。请求里的 max_output 是【上限】
+# 而不是偏好：控制面会把这些字节缓冲在自己的内存里，所以超过此值的请求在
+# 准入处直接被拒。0 表示后端默认（1 MiB），它【不】表示"无限"。
+# max_exec_output_bytes = 8388608
+
+# ── 未认证流量的防洪阈值（按客户端 IP）───────────────────────────────────
+# 认证之前生效，因为未认证的调用者还谈不上租户配额。默认值刻意宽松：
+# 共享 NAT 出口（CI 池、办公室）会让很多正常客户端共用一个 IP。
+# 注意它只按 RemoteAddr 计数，不读 X-Forwarded-For（该头可由攻击者伪造）。
+# preauth.per_second = 200
+# preauth.burst      = 500
+
+# ── 准入与限流 ─────────────────────────────────────────────────────────────
+# max_concurrent_creates：同时在"实施中"的创建数（全局信号量）。它【不】限制
+# 准入数，只限制并发实施数；超出者排队，超过 create_queue_timeout 后以
+# state=failed + "create queue timeout — node is saturated" 显式失败。
+# 租户并发沙箱上限（quota.max_sandboxes）是准入时判断的，且【在竞态下是尽力而为】：
+# 实测 20 路并发创建对上限 5，20 个全部放行（越限 15），突发结束后下一次创建被
+# 402 拒绝。可依赖的是收敛，不是瞬时精确。详见 docs/SECURITY-CONTRACT.md §5。
+# max_concurrent_creates = 8
+
+# 关于每租户×操作组的令牌桶：平台默认值是【硬编码】的
+# （create 1/s burst 5、exec 10/s burst 20、files 20/s burst 40、
+#  snapshot 0.5/s burst 2、admin 1/s burst 5、read 20/s burst 40），
+# 本配置文件【没有】对应键。要调整只能通过管理 API 按租户下发 quota.rates，
+# 即全平台调整需要对每个租户各设一次。这是当前的一个已知缺口。
+
+# ── 用量计量 ──────────────────────────────────────────────────────────────
+# 每租户用量（资源秒 + exec 计数）的采样-落盘周期。资源秒由采样器对
+# 「并发分配 × 墙钟时间」积分（不是请求数 × 固定费率）；exec 计数走请求路径的
+# 内存增量，与资源秒同频落盘，忙碌租户不会为每个 exec 付一次 fsync。
+# 崩溃至多丢一个采样区间；读接口（GET /v1/metering）永远返回已落盘 + 未落盘尾。
+# 设为 0 关闭计量循环，端点仍返回最后一条已落盘记录。计量单位换算见 docs/API.md。
+# meter.every = 30s
+
+# ── WAL 损坏恢复策略 ───────────────────────────────────────────────────────
+# tail-only 默认。尾部撕裂（进程在写入中途死掉）自动修掉；日志【中段】损坏
+#           则拒绝启动——那些帧是已确认并已 fsync 的数据，丢弃它们需要人来做决定。
+# salvage   在首个坏帧处截断，接受其后数据丢失，并如实报告丢了多少字节。
+# strict    任何损坏都拒绝启动，尾部撕裂也不自动修。
+# wal_repair = tail-only

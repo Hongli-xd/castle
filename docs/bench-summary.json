@@ -1,0 +1,11 @@
+{
+  "generated_at": "2026-10-11T10:49:25.345882Z",
+  "image": "sandboxd-test-base:alpine322",
+  "cold_start_to_ready": "7.699s",
+  "exec_p50": "24.611ms",
+  "exec_p99": "35.509ms",
+  "create_p50": "184ms",
+  "create_p99": "196ms",
+  "concurrent_80_create_total": "4.586s",
+  "concurrent_80_admitted": 80
+}

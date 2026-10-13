@@ -123,6 +123,20 @@ func (p EgressPolicy) Validate() error {
 	}
 }
 
+// MountSpec names one host directory the sandbox may see. Host paths are a
+// data boundary: they are gated by the service against an operator-configured
+// allowlist, never against tenant trust, because a tenant who could mount an
+// arbitrary host path — even read-only — could read every file on the node.
+//
+// The only mount this product ever offers is read-only, and that is expressed
+// by the absence of a writable field rather than by a validation rule that
+// could be dropped: a writable host mount is a host-write escape, so it is
+// unrepresentable here on purpose.
+type MountSpec struct {
+	Source string `json:"source"` // absolute host path
+	Target string `json:"target"` // absolute in-sandbox path
+}
+
 // SandboxSpec is the requested shape of a sandbox. It is validated against
 // platform Limits; tenant quotas are a service-layer concern, not here.
 type SandboxSpec struct {
@@ -138,6 +152,10 @@ type SandboxSpec struct {
 	Env                map[string]string `json:"env,omitempty"`
 	User               string            `json:"user,omitempty"`
 	WorkDir            string            `json:"workdir,omitempty"`
+	// Mounts are read-only host directories, opt-in and allowlist-gated by
+	// the service layer. Empty means "no host directory is mounted", which
+	// is the default and the posture the isolation contract pins.
+	Mounts []MountSpec `json:"mounts,omitempty"`
 }
 
 // Limits are the platform-wide ceilings a spec is validated against.
@@ -199,7 +217,26 @@ func (s SandboxSpec) Validate(l Limits, minDiskMiB int) error {
 	if s.WorkDir != "" && (!strings.HasPrefix(s.WorkDir, "/") || strings.Contains(s.WorkDir, "..") || len(s.WorkDir) > 4096) {
 		return apperr.Invalid("workdir must be an absolute in-sandbox path without '..'")
 	}
+	if len(s.Mounts) > 8 {
+		return apperr.Invalid("mounts supports at most 8 entries")
+	}
+	for _, m := range s.Mounts {
+		if !mountPathOK(m.Source) {
+			return apperr.Invalid("mount source must be an absolute path without '..'")
+		}
+		if !mountPathOK(m.Target) || m.Target == "/" {
+			return apperr.Invalid("mount target must be an absolute in-sandbox path (not '/') without '..'")
+		}
+	}
 	return s.Egress.Validate()
+}
+
+// mountPathOK is the shape check shared by mount sources and targets: an
+// absolute path, no traversal segments, bounded length. The allowlist gate
+// that decides *which* host paths are permitted lives in the service layer,
+// where the operator's configuration is visible.
+func mountPathOK(p string) bool {
+	return len(p) > 0 && len(p) <= 4096 && strings.HasPrefix(p, "/") && !strings.Contains(p, "..")
 }
 
 // SandboxBackendRef records how the backend realizes this sandbox. It is

@@ -50,7 +50,10 @@ Base URL：`http(s)://<host>:<port>/v1`。认证：`Authorization: Bearer sk_...
     "env": {"K": "V"},            // 键名 ^[A-Za-z_][A-Za-z0-9_]*$，≤50 项
     "user": "1000",               // 可选
     "workdir": "/root",           // 可选，绝对路径
-    "egress": {"mode": "none"}    // none（默认）| allowlist（容器后端拒绝，501）
+    "egress": {"mode": "none"},   // none（默认）| allowlist（容器后端拒绝，501）
+    "mounts": [                   // 可选，只读宿主目录挂载，≤8 项
+      {"source": "/srv/proj", "target": "/workspace"}
+    ]
   },
   "metadata": {"owner": "ci"}     // k≤64 字符 [a-zA-Z0-9._-]，≤20 项
 }
@@ -58,6 +61,20 @@ Base URL：`http(s)://<host>:<port>/v1`。认证：`Authorization: Bearer sk_...
 
 `201` 返回沙箱记录（含 `id`/`state`/`expires_at`/`backend.ref`）。
 对 **paused** 沙箱的 exec/文件请求默认**自动先恢复再执行**（`auto_resume`，可配）。
+
+**只读宿主目录挂载（`spec.mounts`）**：把操作员白名单内的一个宿主目录以**只读**
+方式挂进沙箱，解决"bash 里看不到项目文件"的可用性——沙箱能 `cat`/`ls`/`python test.py`
+读到真实项目，但**永远写不回宿主**（可写挂载在类型层面即不存在）。三条硬约束：
+
+1. **默认关闭**：`mount.allow` 白名单为空时，任何挂载请求都被 403 拒绝——
+   隔离契约的 `no_host_directory_is_mounted` 金丝雀保持默认通过。
+2. **只读不可协商**：没有可写字段；写入沙箱内挂载点返回 `Read-only file system`，
+   宿主机文件不变。
+3. **白名单门禁**：`source` 必须是 `mount.allow` 列出的目录或其子目录，
+   否则 403——防止租户把 `/etc`、`/root/.ssh` 挂进沙箱读全盘。
+
+运维通过 `mount.allow`（配置项，逗号分隔；环境变量 `SBXD_MOUNT_ALLOW`）授权哪些
+宿主目录可挂。`source`/`target` 均为绝对路径、不含 `..`；`target` 不能是 `/`。
 
 **快照打包**：`pack: {"cleanup": ["/tmp/build", ...]}`（≤16 条绝对路径，拒绝系统根目录）
 在提交前删除构建残留，防止参考答案/凭据进入可复用环境；快照记录带 `packed` 标记。
@@ -98,6 +115,18 @@ stdout/stderr 为 base64（支持二进制输出）。`truncated=true` 表示输
 max_output（默认 1MiB）被截断；`timed_out=true` 表示命中硬超时（进程被终止）。
 非零退出码不构成 HTTP 错误——以 `exit_code` 为准。
 
+**幂等键**（MCP 无状态后的硬要求，见 docs/RESEARCH.md §4.1）：请求可带
+`idempotency_key`（≤128 字节、非空）。首次执行并记住结果；同键重试返回缓存结果、
+`replayed: true`，**不再执行**；同键并发重试合并为一次执行；同键配**不同参数**
+返回 409。缓存作用域为（租户, 沙箱, 幂等键），内存 + TTL（默认 10 分钟），
+daemon 重启后清空（沙箱本身由 reconciler 存活）。
+
+```json
+{"command": "make test", "idempotency_key": "job-42-step-1"}
+// → 首次: {"exit_code":0, "stdout":"...", "replayed":false}
+// → 重试: {"exit_code":0, "stdout":"...", "replayed":true}
+```
+
 ### 文件 API
 
 | 端点 | 说明 |
@@ -127,6 +156,39 @@ max_output（默认 1MiB）被截断；`timed_out=true` 表示命中硬超时（
 `file.put/get/delete`、`snapshot.create/delete`、`key.create/revoke/auth_failed`、
 `tenant.create/update`、`template.create/delete`、`reconcile.fix` 等。
 Detail 只含非敏感元数据（ID/字节数/路径），永不含文件内容与密钥。
+
+## 计量（Metering）
+
+`GET /v1/metering`
+
+租户 Key 自动限定本租户；admin Key 可用 `?tenant=tnt_...` 指定单个租户，
+或省略 `tenant` 查看全舰队。返回的是**单调递增的累计值**（不重置），计费系统
+应当**对两次快照做差分**得到区间账单，而不是让 API 直接返回某个窗口。
+
+```json
+{"usage": [{
+  "tenant_id": "tnt_...",
+  "sandbox_seconds": 3600.0,          // 会话小时 = ÷3600
+  "cpu_millicore_seconds": 1800000.0, // vCPU 小时 = ÷1000÷3600
+  "memory_mib_seconds": 921600.0,     // GiB 小时 = ÷1024÷3600
+  "exec_count": 142,
+  "exec_seconds": 3.8,
+  "updated_at": "2026-10-11T10:00:00Z"
+}]}
+```
+
+计量语义（详见 docs/RESEARCH.md §4.1 与 docs/ROADMAP.md P0-1）：
+
+- **资源秒是采样积分**：采样器对「并发分配 × 墙钟时间」积分，不是「请求数 ×
+  固定费率」。沙箱挂一小时、零 API 流量，也会被正确计量。
+- **CPU 与内存分开累计**：CPU 只在可调度状态（running/provisioning/resuming）
+  累计；**内存在任何非终态都累计**（暂停的沙箱仍占着工作集）——即「I/O 不计，
+  内存照计」。
+- **exec 计数走请求路径的内存增量**，与资源秒按同频（`meter.every`，默认 30s）
+  落盘，忙碌租户不会为每个 exec 付一次 fsync。读接口永远返回「已落盘 + 未落盘尾」，
+  所以一次 exec 在 flush 之前就可见。
+- **幂等重放不计费**：带 `idempotency_key` 的重复执行命中缓存时，`exec_count`
+  不增加——重试不是第二条命令。
 
 ## 租户与 Key 管理（admin Key）
 

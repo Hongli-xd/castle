@@ -96,6 +96,93 @@ func (c *Client) ping(ctx context.Context) error {
 	return err
 }
 
+// infoBody is the subset of GET /info that the isolation posture depends on.
+type infoBody struct {
+	SecurityOptions []string                   `json:"SecurityOptions"`
+	Runtimes        map[string]json.RawMessage `json:"Runtimes"`
+	DefaultRuntime  string                     `json:"DefaultRuntime"`
+}
+
+func (c *Client) info(ctx context.Context) (*infoBody, error) {
+	b, err := c.do(ctx, http.MethodGet, "/info", nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	var ib infoBody
+	if err := json.Unmarshal(b, &ib); err != nil {
+		return nil, apperr.InternalErr("docker /info: %v", err)
+	}
+	return &ib, nil
+}
+
+// hasUserns reports whether this daemon has a user-namespace remap configured.
+//
+// This is the ONLY trustworthy gate for userns. HostConfig.UsernsMode="private"
+// is not a request that can be honoured on demand: a daemon without a remap
+// accepts the field, stores it, and echoes it back from
+// GET /containers/<id>/json verbatim — while the container still runs with the
+// identity map. Measured on Docker 29.5.2 with no userns-remap:
+//
+//	HostConfig.UsernsMode   = "private"   (read back from /json)
+//	/proc/self/uid_map      = 0 0 4294967295   (no mapping; identical to host mode)
+//
+// So setting "private" unconditionally does not fail — it silently does
+// nothing, which is strictly worse than leaving it off, because the control
+// plane would then report a user namespace that does not exist. The daemon's
+// own /info is the authoritative statement of whether remapping is available.
+func (ib *infoBody) hasUserns() bool { return ib.hasSecurityOption("userns") }
+
+// hasSecurityOption reports whether /info advertises a named security feature.
+// The daemon lists these as "name=<feature>" entries (optionally followed by
+// ",key=value" details, e.g. "name=seccomp,profile=builtin").
+func (ib *infoBody) hasSecurityOption(name string) bool {
+	prefix := "name=" + name
+	for _, s := range ib.SecurityOptions {
+		if s == prefix || strings.HasPrefix(s, prefix+",") {
+			return true
+		}
+	}
+	return false
+}
+
+// imageSummary is the subset of GET /images/json used to pick probe images.
+type imageSummary struct {
+	ID       string   `json:"Id"`
+	RepoTags []string `json:"RepoTags"`
+	Size     int64    `json:"Size"`
+}
+
+// smallestUsableImage returns the smallest local image that carries a real
+// repository tag. Used only as a fallback when the operator has not named a
+// probe image: the isolation self-check needs nothing but a shell, so the
+// cheapest local image is the right default.
+func (c *Client) smallestUsableImage(ctx context.Context) (string, error) {
+	b, err := c.do(ctx, http.MethodGet, "/images/json", map[string]string{"all": "0"}, nil)
+	if err != nil {
+		return "", err
+	}
+	var imgs []imageSummary
+	if err := json.Unmarshal(b, &imgs); err != nil {
+		return "", apperr.InternalErr("docker /images/json: %v", err)
+	}
+	best, bestSize := "", int64(-1)
+	for _, im := range imgs {
+		for _, tag := range im.RepoTags {
+			if tag == "" || strings.HasPrefix(tag, "<none>") {
+				continue
+			}
+			if bestSize < 0 || im.Size < bestSize {
+				best, bestSize = tag, im.Size
+			}
+			break
+		}
+	}
+	if best == "" {
+		return "", apperr.Unavailable("no tagged local image to probe with")
+	}
+	return best, nil
+}
+
 // do performs an API call returning the (bounded) body on 2xx. Callers that
 // stream (exec, archive get) use doStream instead.
 func (c *Client) do(ctx context.Context, method, path string, query map[string]string, body io.Reader) ([]byte, error) {

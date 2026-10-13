@@ -11,7 +11,16 @@
  *   SBX_TEMPLATE    template id to boot  (required unless SBX_SANDBOX_ID)
  *   SBX_SANDBOX_ID  attach to an existing sandbox instead of creating one
  *   SBX_CPU / SBX_MEM / SBX_TTL  spec overrides (millicores / MiB / seconds)
+ *   SBX_WORKDIR     host dir mounted read-only into the sandbox (default: process.cwd())
+ *   SBX_MOUNT_TARGET in-sandbox path the workdir appears at (default /workspace)
+ *   SBX_NO_MOUNT    "1" disables the workdir mount entirely (old behaviour)
  *   SBX_KEEP        "1" keeps the sandbox alive on session shutdown
+ *
+ * The workdir mount makes the project visible to bash inside the sandbox,
+ * read-only: `cat`, `ls`, `python test.py` all work against the real files,
+ * but nothing the sandbox writes lands back on the host. The daemon must
+ * allowlist the host directory (config `mount.allow`) or the create is
+ * refused — an honest refusal, not a silent "your files just aren't there".
  *
  * Install:
  *   mkdir -p ~/.pi/agent/extensions && cp -R pi-sbx ~/.pi/agent/extensions/
@@ -29,6 +38,13 @@ const SBX_API_KEY = process.env.SBX_API_KEY ?? "";
 const SBX_TEMPLATE = process.env.SBX_TEMPLATE ?? "";
 const SBX_SANDBOX_ID = process.env.SBX_SANDBOX_ID ?? "";
 const SBX_KEEP = process.env.SBX_KEEP === "1";
+const SBX_WORKDIR = process.env.SBX_WORKDIR ?? process.cwd();
+const SBX_MOUNT_TARGET = process.env.SBX_MOUNT_TARGET ?? "/workspace";
+const SBX_NO_MOUNT = process.env.SBX_NO_MOUNT === "1";
+// The workdir mount is what makes the project visible inside the sandbox.
+// When it is off, bash runs from "/" with no workdir passthrough (old path).
+const mountEnabled = !SBX_NO_MOUNT && SBX_WORKDIR !== "";
+const bashCwd = mountEnabled ? SBX_MOUNT_TARGET : "/";
 const DEFAULT_EXEC_TIMEOUT = 120; // seconds
 
 class SandboxdError extends Error {
@@ -95,6 +111,9 @@ class SandboxClient {
 		if (process.env.SBX_CPU) spec.cpu_millicores = Number(process.env.SBX_CPU);
 		if (process.env.SBX_MEM) spec.memory_mib = Number(process.env.SBX_MEM);
 		if (process.env.SBX_TTL) spec.timeout_seconds = Number(process.env.SBX_TTL);
+		if (mountEnabled) {
+			spec.mounts = [{ source: SBX_WORKDIR, target: SBX_MOUNT_TARGET }];
+		}
 		const created = await new SandboxClient("").request("POST", "/v1/sandboxes?wait=true", {
 			template_id: SBX_TEMPLATE,
 			...(Object.keys(spec).length ? { spec } : {}),
@@ -102,11 +121,12 @@ class SandboxClient {
 		return new SandboxClient(created.id);
 	}
 
-	async exec(command: string, timeoutSeconds: number): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+	async exec(command: string, timeoutSeconds: number, workdir?: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
 		const result = await this.request("POST", `/v1/sandboxes/${this.sandboxId}/exec`, {
 			command,
 			timeout_ms: Math.max(1, Math.round(timeoutSeconds * 1000)),
 			max_output: 1 << 20,
+			...(workdir ? { workdir } : {}),
 		});
 		const decode = (b64: string | null | undefined): string => {
 			if (!b64) return "";
@@ -162,8 +182,11 @@ export default function (pi: ExtensionAPI) {
 						: undefined;
 				try {
 					// The daemon enforces the hard deadline server-side; the
-					// client abort just stops waiting for the response.
-					const result = await active.exec(command, effectiveTimeout + 5);
+					// client abort just stops waiting for the response. The
+					// workdir passthrough (mount enabled) makes relative paths
+					// resolve against the mounted project, so `python test.py`
+					// runs where the agent thinks it is.
+					const result = await active.exec(command, effectiveTimeout + 5, mountEnabled ? _cwd : undefined);
 					// BashOperations streams output through onData as bytes —
 					// dropping it here would leave the agent blind to results.
 					const encoder = new TextEncoder();
@@ -182,10 +205,13 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerTool({
-		...createBashTool(process.cwd(), { operations: bashOperations() }),
-		description:
-			"Runs a bash command inside the sandboxd sandbox (isolated filesystem, no host access). " +
-			"The host working directory is NOT visible inside the sandbox; upload files with `cat > file` heredocs via this tool if needed.",
+		...createBashTool(bashCwd, { operations: bashOperations() }),
+		description: mountEnabled
+			? `Runs a bash command inside the sandboxd sandbox (isolated filesystem, no host write access). ` +
+			  `The host working directory (${SBX_WORKDIR}) is mounted read-only at ${SBX_MOUNT_TARGET}, so ` +
+			  `cat/ls/python all see the real project, but nothing written inside the sandbox reaches the host.`
+			: "Runs a bash command inside the sandboxd sandbox (isolated filesystem, no host access). " +
+			  "The host working directory is NOT visible; set SBX_WORKDIR (and the daemon's mount.allow) to mount it read-only.",
 	});
 
 	pi.registerCommand("sbx", {

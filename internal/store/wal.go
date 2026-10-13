@@ -18,11 +18,25 @@ var frameCRCTable = crc32.MakeTable(crc32.Castagnoli)
 
 const (
 	frameHeaderLen = 8 // [len u32][crc32 u32]
+	maxFrameLen    = 64 * 1024 * 1024
 )
 
-// append serializes one mutation as a frame and fsyncs before returning.
-// The write happens under the caller's lock (Store.mu write-side or init).
-func (s *Store) append(k frameKind, op, id string, data any) error {
+// appendLocked serializes one mutation as a frame and fsyncs before returning.
+//
+// The caller MUST hold s.mu for writing. That is not a style preference: the
+// order of frames on disk and the order in which the caller publishes the
+// change into the in-memory maps have to happen inside the same critical
+// section. If they can interleave (append outside the lock), a crash replays a
+// different history than the one the process was serving, and an
+// acknowledged write is silently lost.
+//
+// In v1.1.0 the Put*/AppendEvent family called this outside the lock while
+// Update*/Delete* called it inside — a 4.2% acknowledged-write loss rate under
+// concurrency (poc/walrace). Every mutation now takes the same path.
+func (s *Store) appendLocked(k frameKind, op, id string, data any) error {
+	if s.poisoned != nil {
+		return s.poisoned
+	}
 	var raw json.RawMessage
 	if data != nil {
 		b, err := json.Marshal(data)
@@ -40,23 +54,57 @@ func (s *Store) append(k frameKind, op, id string, data any) error {
 	binary.BigEndian.PutUint32(buf[4:8], crc32.Checksum(payload, frameCRCTable))
 	copy(buf[8:], payload)
 
+	// Offset our frame will occupy. Captured BEFORE the write: we hold the
+	// write lock and are the only writer, so the current size is the append
+	// point. (v1.1.0 read the size *after* writing, which made the rollback
+	// below a no-op truncate-to-self and let a torn frame through.)
+	before := s.walSize()
+
 	n, err := s.wal.Write(buf)
 	if err != nil {
-		// A partial write leaves a torn tail; rewind so the log stays valid
-		// and later appends do not sit behind garbage.
-		_ = s.wal.Truncate(int64(s.walSize()))
-		return apperr.InternalErr("wal write: %v", err)
+		return s.rewindLocked(before, err, n, len(buf))
 	}
 	if n != len(buf) {
-		_ = s.wal.Truncate(int64(s.walSize()))
-		return apperr.InternalErr("wal short write (%d/%d bytes)", n, len(buf))
+		return s.rewindLocked(before, nil, n, len(buf))
 	}
 	if !s.opts.DisableSync {
 		if err := s.wal.Sync(); err != nil {
-			return apperr.InternalErr("wal fsync: %v", err)
+			// The bytes are in the file but not durable. Returning an error
+			// without rewinding would let a later restart replay a mutation
+			// the caller was told had failed — a phantom write. Rewind.
+			return s.rewindLocked(before, nil, n, len(buf))
 		}
 	}
 	return nil
+}
+
+// rewindLocked discards everything at or after `before`, so the WAL ends on a
+// frame boundary and no later append can sit behind garbage. It is only called
+// with the write lock held.
+//
+// If the rewind itself fails we can no longer promise that disk matches what
+// we acknowledge, so the store poisons itself: further writes fail, /readyz
+// reports it, and the operator restarts onto a clean rewind rather than
+// running on a log whose tail is unknown.
+func (s *Store) rewindLocked(before int64, cause error, n, want int) error {
+	// The WAL handle is opened O_APPEND, so the next write lands at the new
+	// end regardless of the file offset. ftruncate is enough.
+	terr := s.wal.Truncate(before)
+	if terr == nil && !s.opts.DisableSync {
+		// Without this sync a crash could resurrect the pre-truncate length,
+		// turning a reported failure back into a durable phantom frame.
+		terr = s.wal.Sync()
+	}
+	if terr != nil {
+		s.poisoned = apperr.InternalErr(
+			"wal is in an unknown state: a write failed and the rollback to offset %d also failed (%v); refusing further writes",
+			before, terr)
+		return s.poisoned
+	}
+	if cause != nil {
+		return apperr.InternalErr("wal write: %v", cause)
+	}
+	return apperr.InternalErr("wal short write (%d/%d bytes)", n, want)
 }
 
 func (s *Store) walSize() int64 {
@@ -82,6 +130,7 @@ func (s *Store) loadCompacted() error {
 		Sandboxes []*domain.Sandbox    `json:"sandboxes"`
 		Snapshots []*domain.Snapshot   `json:"snapshots"`
 		Templates []*domain.Template   `json:"templates"`
+		Usages    []*domain.Usage      `json:"usages"`
 		Events    []*domain.AuditEvent `json:"events"`
 	}
 	if err := json.Unmarshal(blob, &all); err != nil {
@@ -104,6 +153,9 @@ func (s *Store) loadCompacted() error {
 	for _, t := range all.Templates {
 		s.templates[t.ID] = t
 	}
+	for _, u := range all.Usages {
+		s.usages[u.TenantID] = u
+	}
 	if len(all.Events) > s.opts.MaxEvents {
 		all.Events = all.Events[len(all.Events)-s.opts.MaxEvents:]
 	}
@@ -111,46 +163,205 @@ func (s *Store) loadCompacted() error {
 	return nil
 }
 
-// replayAndRepair reads wal.log, applies every intact frame, and truncates
-// the file at the first torn frame. Anything after damage is untrusted —
-// including frames that "look" valid — because ordering guarantees died
-// with the torn write.
+// RepairPolicy decides what the store does when the log is damaged.
+type RepairPolicy int
+
+const (
+	// RepairTailOnly (default) truncates a torn tail — the ordinary crash
+	// case, where the last frame was mid-write when the process died — and
+	// REFUSES to start when the damage is in the middle of the log. A silent
+	// truncate there discards transactions that were acknowledged and
+	// fsynced, which is exactly the failure a WAL exists to prevent.
+	RepairTailOnly RepairPolicy = iota
+	// RepairSalvage truncates at the first damaged frame wherever it is.
+	// Everything after the damage is discarded, silently and deliberately.
+	// This is the v1.1.0 behaviour, kept as an explicit opt-in for operators
+	// who would rather lose the tail than stay down.
+	RepairSalvage
+	// RepairStrict refuses to start on any damage at all, torn tail included.
+	// For deployments that would rather page a human than auto-repair.
+	RepairStrict
+)
+
+func (p RepairPolicy) String() string {
+	switch p {
+	case RepairSalvage:
+		return "salvage"
+	case RepairStrict:
+		return "strict"
+	default:
+		return "tail-only"
+	}
+}
+
+// RepairReport describes what recovery found and did with the log. It is
+// surfaced at startup and via Store.Repair so an operator can tell a routine
+// crash recovery from real log damage without reading the log file.
+type RepairReport struct {
+	Damaged      bool
+	Kind         string // "torn-tail" | "mid-log" | ""
+	Reason       string // human-readable cause at the damage offset
+	Action       string // "none" | "truncate" | "salvage" | "refuse"
+	AtOffset     int64
+	FramesKept   int
+	BytesKept    int64
+	BytesDropped int64
+}
+
+func (r RepairReport) String() string {
+	if !r.Damaged {
+		return "intact"
+	}
+	return fmt.Sprintf("%s at offset %d (%s): %s, kept %d frames/%d bytes, dropped %d bytes",
+		r.Kind, r.AtOffset, r.Reason, r.Action, r.FramesKept, r.BytesKept, r.BytesDropped)
+}
+
+// replayAndRepair reads wal.log, applies every intact frame, and decides what
+// to do about the first damaged one.
+//
+// Damage is classified before it is acted on. A torn tail is routine: the
+// write that was in flight when the process died is not a committed
+// transaction, so dropping it is correct. Damage in the middle is not
+// routine — the frames after it were written and fsynced by a process that
+// was still running, so they were acknowledged and must not disappear
+// without a human saying so.
 func (s *Store) replayAndRepair() error {
 	blob, err := os.ReadFile(s.walPath())
 	if os.IsNotExist(err) {
+		s.repair = RepairReport{Action: "none"}
 		return nil
 	}
 	if err != nil {
 		return apperr.InternalErr("read wal: %v", err)
 	}
-	good := 0
-	off := 0
-	for off+frameHeaderLen <= len(blob) {
-		ln := binary.BigEndian.Uint32(blob[off : off+4])
-		crc := binary.BigEndian.Uint32(blob[off+4 : off+8])
-		if ln > 64*1024*1024 || off+8+int(ln) > len(blob) {
-			break // torn or absurd length
+
+	off, frames := 0, 0
+	for off < len(blob) {
+		fr, size, ok, reason := decodeFrameAt(blob, off)
+		if !ok {
+			return s.handleDamage(blob, off, frames, reason)
 		}
-		payload := blob[off+8 : off+8+int(ln)]
-		if crc32.Checksum(payload, frameCRCTable) != crc {
-			break // torn frame
+		if err := s.applyFrame(fr); err != nil {
+			return s.handleDamage(blob, off, frames, "frame cannot be applied: "+err.Error())
 		}
-		var fr frame
-		if err := json.Unmarshal(payload, &fr); err != nil {
-			break
-		}
-		if err := s.applyFrame(&fr); err != nil {
-			break
-		}
-		off += 8 + int(ln)
-		good = off
+		off += size
+		frames++
 	}
-	if good < len(blob) {
-		if err := os.Truncate(s.walPath(), int64(good)); err != nil {
-			return apperr.InternalErr("truncate torn wal tail: %v", err)
-		}
-	}
+	s.repair = RepairReport{Action: "none", FramesKept: frames, BytesKept: int64(off)}
 	return nil
+}
+
+// decodeFrameAt validates one frame without applying it: header sanity, CRC,
+// and JSON shape. It is the only place that reads a frame off the log, so the
+// tail-scan below and the replay loop can never disagree about validity.
+func decodeFrameAt(blob []byte, off int) (*frame, int, bool, string) {
+	if off+frameHeaderLen > len(blob) {
+		return nil, 0, false, "trailing bytes shorter than a frame header"
+	}
+	ln := binary.BigEndian.Uint32(blob[off : off+4])
+	crc := binary.BigEndian.Uint32(blob[off+4 : off+8])
+	if ln > maxFrameLen {
+		return nil, 0, false, fmt.Sprintf("frame length %d exceeds the %d byte limit", ln, maxFrameLen)
+	}
+	if off+frameHeaderLen+int(ln) > len(blob) {
+		return nil, 0, false, fmt.Sprintf("frame claims %d bytes but only %d remain", ln, len(blob)-off-frameHeaderLen)
+	}
+	payload := blob[off+frameHeaderLen : off+frameHeaderLen+int(ln)]
+	if crc32.Checksum(payload, frameCRCTable) != crc {
+		return nil, 0, false, "frame crc mismatch"
+	}
+	var fr frame
+	if err := json.Unmarshal(payload, &fr); err != nil {
+		return nil, 0, false, "frame payload is not valid JSON: " + err.Error()
+	}
+	return &fr, frameHeaderLen + int(ln), true, ""
+}
+
+// damageScanWindow bounds how far past the damage we look for a surviving
+// frame before calling it a tail tear. Cyclic corruption of a whole region
+// should not turn startup into an O(n^2) scan.
+const damageScanWindow = 1 << 20
+
+// handleDamage classifies the damage at `off` and applies the repair policy.
+func (s *Store) handleDamage(blob []byte, off, frames int, reason string) error {
+	mid := s.intactFrameAfter(blob, off)
+	kind := "torn-tail"
+	if mid {
+		kind = "mid-log"
+	}
+	rep := RepairReport{
+		Damaged:      true,
+		Kind:         kind,
+		Reason:       reason,
+		AtOffset:     int64(off),
+		FramesKept:   frames,
+		BytesKept:    int64(off),
+		BytesDropped: int64(len(blob) - off),
+	}
+
+	// A torn tail is the expected crash signature; the policy decides whether
+	// to auto-repair it. Mid-log damage is only ever truncated when the
+	// operator has explicitly accepted tail loss.
+	truncate := false
+	switch s.opts.Repair {
+	case RepairStrict:
+		truncate = false
+	case RepairSalvage:
+		truncate = true
+	default: // RepairTailOnly
+		truncate = !mid
+	}
+
+	if !truncate {
+		rep.Action = "refuse"
+		s.repair = rep
+		return apperr.New(apperr.Internal, fmt.Sprintf(
+			"refusing to start: %s wal damage at offset %d (%s); %d bytes / %d intact frames precede it. "+
+				"Restore from a backup (Store.Backup) and replay, or start with repair=salvage to "+
+				"explicitly accept losing those bytes. (policy=%s, scanned_to=%d)",
+			kind, off, reason, off, frames, s.opts.Repair, s.damageScanEnd(off)))
+	}
+
+	if err := os.Truncate(s.walPath(), int64(off)); err != nil {
+		return apperr.InternalErr("truncate damaged wal tail at %d: %v", off, err)
+	}
+	syncDir(s.dir)
+	if kind == "torn-tail" {
+		rep.Action = "truncate"
+	} else {
+		rep.Action = "salvage"
+	}
+	s.repair = rep
+	return nil
+}
+
+func (s *Store) damageScanEnd(off int) int {
+	return off + damageScanWindow
+}
+
+// intactFrameAfter reports whether a decodable frame starts somewhere after
+// `off`. The fast path is the byte right after the damaged frame's declared
+// length, which is where the next frame boundary is when only the payload rotted.
+// Only if that misses do we scan, and only within damageScanWindow.
+func (s *Store) intactFrameAfter(blob []byte, off int) bool {
+	if off+frameHeaderLen <= len(blob) {
+		ln := int(binary.BigEndian.Uint32(blob[off : off+4]))
+		if cand := off + frameHeaderLen + ln; cand > off && cand < len(blob) {
+			if _, _, ok, _ := decodeFrameAt(blob, cand); ok {
+				return true
+			}
+		}
+	}
+	end := off + 1 + damageScanWindow
+	if end > len(blob) {
+		end = len(blob)
+	}
+	for pos := off + 1; pos+frameHeaderLen <= end; pos++ {
+		if _, _, ok, _ := decodeFrameAt(blob, pos); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) applyFrame(fr *frame) error {
@@ -212,6 +423,16 @@ func (s *Store) applyFrame(fr *frame) error {
 			return err
 		}
 		s.templates[t.ID] = &t
+	case fkUsage:
+		if fr.Op == "del" {
+			delete(s.usages, fr.ID)
+			return nil
+		}
+		var u domain.Usage
+		if err := json.Unmarshal(fr.Data, &u); err != nil {
+			return err
+		}
+		s.usages[u.TenantID] = &u
 	case fkEvent:
 		var ev domain.AuditEvent
 		if err := json.Unmarshal(fr.Data, &ev); err != nil {
@@ -233,6 +454,13 @@ func (s *Store) applyFrame(fr *frame) error {
 func (s *Store) Compact() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Compaction is destructive: it rewrites data.json from in-memory state and
+	// then truncates the log. If a failed write poisoned the WAL, in-memory
+	// state may be missing a mutation that IS on disk, so compacting now would
+	// turn a recoverable ambiguity into permanent loss.
+	if s.poisoned != nil {
+		return s.poisoned
+	}
 	blob, err := s.marshalAll()
 	if err != nil {
 		return err
@@ -281,30 +509,32 @@ func syncDir(dir string) {
 }
 
 // ---- single-writer directory lock -------------------------------------------
+//
+// The lock handle is owned by the Store, not by the package. v1.1.0 kept it in
+// a package-level variable, so opening a second Store overwrote the first
+// Store's handle: closing either one released the other's flock, and the
+// original fd leaked. Reproduced in poc/lockleak.
 
-var lockFile *os.File
-
-func lockDir(dir string) error {
+func lockDir(dir string) (*os.File, error) {
 	f, err := os.OpenFile(filepath.Join(dir, "lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return apperr.InternalErr("open lock file: %v", err)
+		return nil, apperr.InternalErr("open lock file: %v", err)
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		f.Close()
-		return apperr.ConflictErr("data directory is locked by another sandboxd process (%v)", err)
+		return nil, apperr.ConflictErr("data directory is locked by another sandboxd process (%v)", err)
 	}
-	lockFile = f
-	return nil
+	return f, nil
 }
 
-func unlockDir() error {
-	if lockFile == nil {
+func unlockDir(f *os.File) error {
+	if f == nil {
 		return nil
 	}
-	_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
-	_ = lockFile.Close()
-	lockFile = nil
-	return nil
+	// Closing the descriptor releases the flock; the explicit LOCK_UN keeps
+	// the ordering obvious and is harmless on a fd we are about to close.
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	return f.Close()
 }
 
 // UptimeNote exists so the package keeps a compile-time link to time even if

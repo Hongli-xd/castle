@@ -14,6 +14,26 @@
 //
 // The interface is deliberately narrow; a Postgres-backed implementation can
 // replace this package without touching callers.
+//
+// # Invariants
+//
+// These are the rules that make the store crash-correct. They are enforced by
+// TestAppendAlwaysUnderWriteLock and the recovery tests, not just by comment:
+//
+//  1. Every mutation appends its WAL frame AND publishes to the in-memory maps
+//     inside the same s.mu write-lock window (appendLocked). Splitting those
+//     two steps — as v1.1.0's Put* family did — lets a crash replay a history
+//     the process never served, and silently loses acknowledged writes.
+//  2. The store never keeps a caller-owned pointer and never hands out one of
+//     its own: every boundary clones. Otherwise a caller mutating an object it
+//     still holds would change persisted state with no WAL frame.
+//  3. A failed write rewinds the log to the frame boundary it started at. An
+//     fsync failure also rewinds, so a caller told "failed" cannot have its
+//     mutation replayed as durable (a phantom write).
+//  4. If a rewind fails, the store is poisoned: mutations fail fast and
+//     Healthy() reports why, rather than running on a log of unknown shape.
+//  5. Recovery distinguishes a torn tail (routine, droppable) from mid-log
+//     damage (acknowledged and fsynced data, never dropped silently).
 package store
 
 import (
@@ -35,6 +55,10 @@ type Options struct {
 	MaxEvents int
 	// DisableSync skips fsync — benchmarks and throwaway test stores only.
 	DisableSync bool
+	// Repair decides how recovery treats a damaged log. The zero value,
+	// RepairTailOnly, is the safe default: torn tails are routine crash
+	// debris, mid-log damage is not.
+	Repair RepairPolicy
 }
 
 type Store struct {
@@ -43,12 +67,23 @@ type Store struct {
 	wal  *os.File
 	opts Options
 
+	// lockFile is this store's flock handle. It must be per-instance: a
+	// package-level handle lets one store's Close release another's lock.
+	lockFile *os.File
+	// poisoned is set when the WAL reached an unknown state (a write failed
+	// and the rollback failed too). Every mutation then fails fast instead of
+	// pretending the store is writable.
+	poisoned error
+	// repair records what recovery found at open time.
+	repair RepairReport
+
 	tenants   map[string]*domain.Tenant
 	keys      map[string]*domain.APIKey
 	keysByPre map[string]*domain.APIKey
 	sandboxes map[string]*domain.Sandbox
 	snapshots map[string]*domain.Snapshot
 	templates map[string]*domain.Template
+	usages    map[string]*domain.Usage
 	events    []*domain.AuditEvent // append-only, capped
 }
 
@@ -60,19 +95,31 @@ func Open(dir string, opts Options) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, apperr.InternalErr("create data dir: %v", err)
 	}
-	if err := lockDir(dir); err != nil {
+	lock, err := lockDir(dir)
+	if err != nil {
 		return nil, err
 	}
 	s := &Store{
 		dir:       dir,
 		opts:      opts,
+		lockFile:  lock,
 		tenants:   map[string]*domain.Tenant{},
 		keys:      map[string]*domain.APIKey{},
 		keysByPre: map[string]*domain.APIKey{},
 		sandboxes: map[string]*domain.Sandbox{},
 		snapshots: map[string]*domain.Snapshot{},
 		templates: map[string]*domain.Template{},
+		usages:    map[string]*domain.Usage{},
 	}
+	// Any failure past this point must release the directory lock, otherwise
+	// this process leaks it and holds the data dir hostage for its lifetime.
+	opened := false
+	defer func() {
+		if !opened {
+			_ = unlockDir(s.lockFile)
+			s.lockFile = nil
+		}
+	}()
 	if err := s.loadCompacted(); err != nil {
 		return nil, err
 	}
@@ -84,14 +131,32 @@ func Open(dir string, opts Options) (*Store, error) {
 		return nil, apperr.InternalErr("open wal: %v", err)
 	}
 	s.wal = f
+	opened = true
 	return s, nil
 }
 
 func (s *Store) walPath() string       { return filepath.Join(s.dir, "wal.log") }
 func (s *Store) compactedPath() string { return filepath.Join(s.dir, "data.json") }
 
+// Repair reports what recovery found and did with the log at open time. It is
+// advisory: an intact log reports Action "none".
+func (s *Store) Repair() RepairReport {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.repair
+}
+
+// Healthy returns the reason the store cannot accept writes, or nil. /readyz
+// uses it so a poisoned store is taken out of rotation instead of serving
+// writes that will all fail.
+func (s *Store) Healthy() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.poisoned
+}
+
 // Close releases the WAL handle and the directory lock. Data is durable at
-// every mutation boundary; Close only needs to be tidy.
+// every mutation boundary; Close only needs to be tidy. It is idempotent.
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -99,7 +164,12 @@ func (s *Store) Close() error {
 		_ = s.wal.Close()
 		s.wal = nil
 	}
-	return unlockDir()
+	if s.lockFile != nil {
+		err := unlockDir(s.lockFile)
+		s.lockFile = nil
+		return err
+	}
+	return nil
 }
 
 // ---- entity records -------------------------------------------------------
@@ -112,6 +182,7 @@ const (
 	fkSandbox  frameKind = "sandbox"
 	fkSnapshot frameKind = "snapshot"
 	fkTemplate frameKind = "template"
+	fkUsage    frameKind = "usage"
 	fkEvent    frameKind = "event"
 )
 
@@ -124,6 +195,11 @@ type frame struct {
 
 // ---- tenants --------------------------------------------------------------
 
+// PutTenant inserts or replaces a tenant. The frame is appended and the map
+// is updated inside the same write-lock window, so the log on disk and the
+// in-memory view can never be ordered differently. The store keeps its own
+// copy: a caller that mutates the pointer afterwards cannot change persisted
+// state without going through UpdateTenant.
 func (s *Store) PutTenant(t *domain.Tenant) error {
 	if t.ID == "" {
 		return apperr.InternalErr("tenant missing ID")
@@ -131,12 +207,12 @@ func (s *Store) PutTenant(t *domain.Tenant) error {
 	if t.Version == 0 {
 		t.Version = 1
 	}
-	if err := s.append(fkTenant, "put", t.ID, t); err != nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.appendLocked(fkTenant, "put", t.ID, t); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	s.tenants[t.ID] = t
-	s.mu.Unlock()
+	s.tenants[t.ID] = cloneTenant(t)
 	return nil
 }
 
@@ -144,7 +220,10 @@ func (s *Store) GetTenant(id string) (*domain.Tenant, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	t, ok := s.tenants[id]
-	return t, ok
+	if !ok {
+		return nil, false
+	}
+	return cloneTenant(t), true
 }
 
 // UpdateTenant runs fn under the write lock with CAS on baseVersion. fn may
@@ -169,7 +248,7 @@ func (s *Store) UpdateTenant(id string, baseVersion int64, fn func(t *domain.Ten
 	if err := next.Validate(domain.Limits{MaxCPUMillicores: 1 << 30, MaxMemoryMiB: 1 << 30, MaxTimeoutSeconds: 1 << 30}); err != nil {
 		return nil, err
 	}
-	if err := s.append(fkTenant, "put", id, next); err != nil {
+	if err := s.appendLocked(fkTenant, "put", id, next); err != nil {
 		return nil, err
 	}
 	s.tenants[id] = next
@@ -207,13 +286,14 @@ func (s *Store) PutKey(k *domain.APIKey) error {
 	if k.Version == 0 {
 		k.Version = 1
 	}
-	if err := s.append(fkKey, "put", k.ID, k); err != nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.appendLocked(fkKey, "put", k.ID, k); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	s.keys[k.ID] = k
-	s.keysByPre[k.Prefix] = k
-	s.mu.Unlock()
+	stored := cloneKey(k)
+	s.keys[stored.ID] = stored
+	s.keysByPre[stored.Prefix] = stored
 	return nil
 }
 
@@ -221,14 +301,39 @@ func (s *Store) GetKey(id string) (*domain.APIKey, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	k, ok := s.keys[id]
-	return k, ok
+	if !ok {
+		return nil, false
+	}
+	return cloneKey(k), true
 }
 
 func (s *Store) KeyByPrefix(prefix string) (*domain.APIKey, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	k, ok := s.keysByPre[prefix]
-	return k, ok
+	if !ok {
+		return nil, false
+	}
+	return cloneKey(k), true
+}
+
+// cloneKey copies an API key, including the pointer-valued timestamps: a
+// shallow copy would share them, so a later write through either copy would be
+// visible from the other.
+func cloneKey(k *domain.APIKey) *domain.APIKey {
+	c := *k
+	c.ExpiresAt = cloneTimePtr(k.ExpiresAt)
+	c.RevokedAt = cloneTimePtr(k.RevokedAt)
+	c.LastUsedAt = cloneTimePtr(k.LastUsedAt)
+	return &c
+}
+
+func cloneTimePtr(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+	c := *t
+	return &c
 }
 
 func (s *Store) UpdateKey(id string, baseVersion int64, fn func(k *domain.APIKey) error) (*domain.APIKey, error) {
@@ -238,7 +343,7 @@ func (s *Store) UpdateKey(id string, baseVersion int64, fn func(k *domain.APIKey
 	if !ok {
 		return nil, apperr.NotFoundErr("api key")
 	}
-	next := *cur
+	next := *cloneKey(cur)
 	if err := fn(&next); err != nil {
 		return nil, err
 	}
@@ -246,16 +351,16 @@ func (s *Store) UpdateKey(id string, baseVersion int64, fn func(k *domain.APIKey
 		return nil, apperr.ConflictErr("api key was modified concurrently")
 	}
 	next.Version = cur.Version + 1
-	if err := s.append(fkKey, "put", id, &next); err != nil {
+	if err := s.appendLocked(fkKey, "put", id, &next); err != nil {
 		return nil, err
 	}
-	if cur.Prefix != next.Prefix {
+	stored := cloneKey(&next)
+	if cur.Prefix != stored.Prefix {
 		delete(s.keysByPre, cur.Prefix)
 	}
-	s.keys[id] = &next
-	s.keysByPre[next.Prefix] = &next
-	out := next
-	return &out, nil
+	s.keys[id] = stored
+	s.keysByPre[stored.Prefix] = stored
+	return cloneKey(stored), nil
 }
 
 func (s *Store) ListKeys(tenantID string) []*domain.APIKey {
@@ -264,7 +369,7 @@ func (s *Store) ListKeys(tenantID string) []*domain.APIKey {
 	var out []*domain.APIKey
 	for _, k := range s.keys {
 		if k.TenantID == tenantID {
-			out = append(out, func() *domain.APIKey { c := *k; return &c }())
+			out = append(out, cloneKey(k))
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
@@ -280,12 +385,12 @@ func (s *Store) PutSandbox(sb *domain.Sandbox) error {
 	if sb.Version == 0 {
 		sb.Version = 1 // a persisted entity is at least at its first version
 	}
-	if err := s.append(fkSandbox, "put", sb.ID, sb); err != nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.appendLocked(fkSandbox, "put", sb.ID, sb); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	s.sandboxes[sb.ID] = sb
-	s.mu.Unlock()
+	s.sandboxes[sb.ID] = cloneSandbox(sb)
 	return nil
 }
 
@@ -296,8 +401,7 @@ func (s *Store) GetSandbox(id string) (*domain.Sandbox, bool) {
 	if !ok {
 		return nil, false
 	}
-	c := *sb
-	return &c, true
+	return cloneSandbox(sb), true
 }
 
 // UpdateSandbox is the only sanctioned way to mutate a live sandbox. It
@@ -319,7 +423,7 @@ func (s *Store) UpdateSandbox(id string, baseVersion int64, fn func(sb *domain.S
 	}
 	next.Version = cur.Version + 1
 	next.UpdatedAt = time.Now().UTC()
-	if err := s.append(fkSandbox, "put", id, next); err != nil {
+	if err := s.appendLocked(fkSandbox, "put", id, next); err != nil {
 		return nil, err
 	}
 	s.sandboxes[id] = next
@@ -336,7 +440,7 @@ func (s *Store) DeleteSandbox(id string, baseVersion int64) error {
 	if baseVersion >= 0 && cur.Version != baseVersion {
 		return apperr.ConflictErr("sandbox %s was modified concurrently", id)
 	}
-	if err := s.append(fkSandbox, "del", id, nil); err != nil {
+	if err := s.appendLocked(fkSandbox, "del", id, nil); err != nil {
 		return err
 	}
 	delete(s.sandboxes, id)
@@ -354,7 +458,7 @@ func (s *Store) ListSandboxes(tenantID string, state *domain.SandboxState) []*do
 		if state != nil && sb.State != *state {
 			continue
 		}
-		out = append(out, func() *domain.Sandbox { c := *sb; return &c }())
+		out = append(out, cloneSandbox(sb))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
 	return out
@@ -373,6 +477,47 @@ func (s *Store) ForEachSandbox(fn func(sb *domain.Sandbox) bool) {
 	}
 }
 
+// ForEachSnapshot and ForEachTemplate enumerate every record regardless of
+// owner. ListSnapshots("") happens to mean "all", but ListTemplates("") means
+// "public plus the empty tenant" — a difference that is easy to miss and
+// dangerous to rely on. The reconciler's image pass must see every
+// referenced image, so it asks for all of them explicitly.
+func (s *Store) ForEachSnapshot(fn func(sn *domain.Snapshot) bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, sn := range s.snapshots {
+		if !fn(cloneSnapshot(sn)) {
+			return
+		}
+	}
+}
+
+func (s *Store) ForEachTemplate(fn func(t *domain.Template) bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, t := range s.templates {
+		if !fn(cloneTemplate(t)) {
+			return
+		}
+	}
+}
+
+// cloneSpec copies a SandboxSpec, including its map and slice fields. A plain
+// struct copy would leave Env/Egress.Allow aliased to the caller.
+func cloneSpec(sp domain.SandboxSpec) domain.SandboxSpec {
+	c := sp
+	if sp.Env != nil {
+		c.Env = make(map[string]string, len(sp.Env))
+		for k, v := range sp.Env {
+			c.Env[k] = v
+		}
+	}
+	if sp.Egress.Allow != nil {
+		c.Egress.Allow = append([]string(nil), sp.Egress.Allow...)
+	}
+	return c
+}
+
 func cloneSandbox(sb *domain.Sandbox) *domain.Sandbox {
 	c := *sb
 	if sb.Metadata != nil {
@@ -381,14 +526,30 @@ func cloneSandbox(sb *domain.Sandbox) *domain.Sandbox {
 			c.Metadata[k] = v
 		}
 	}
-	if sb.Spec.Env != nil {
-		c.Spec.Env = make(map[string]string, len(sb.Spec.Env))
-		for k, v := range sb.Spec.Env {
-			c.Spec.Env[k] = v
+	c.Spec = cloneSpec(sb.Spec)
+	return &c
+}
+
+func cloneSnapshot(sn *domain.Snapshot) *domain.Snapshot {
+	c := *sn
+	c.Spec = cloneSpec(sn.Spec)
+	return &c
+}
+
+func cloneTemplate(t *domain.Template) *domain.Template {
+	c := *t
+	c.Composition = append([]string(nil), t.Composition...)
+	c.DefaultSpec = cloneSpec(t.DefaultSpec)
+	return &c
+}
+
+func cloneEvent(ev *domain.AuditEvent) *domain.AuditEvent {
+	c := *ev
+	if ev.Detail != nil {
+		c.Detail = make(map[string]string, len(ev.Detail))
+		for k, v := range ev.Detail {
+			c.Detail[k] = v
 		}
-	}
-	if sb.Spec.Egress.Allow != nil {
-		c.Spec.Egress.Allow = append([]string(nil), sb.Spec.Egress.Allow...)
 	}
 	return &c
 }
@@ -402,12 +563,12 @@ func (s *Store) PutSnapshot(sn *domain.Snapshot) error {
 	if sn.Version == 0 {
 		sn.Version = 1
 	}
-	if err := s.append(fkSnapshot, "put", sn.ID, sn); err != nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.appendLocked(fkSnapshot, "put", sn.ID, sn); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	s.snapshots[sn.ID] = sn
-	s.mu.Unlock()
+	s.snapshots[sn.ID] = cloneSnapshot(sn)
 	return nil
 }
 
@@ -418,8 +579,7 @@ func (s *Store) GetSnapshot(id string) (*domain.Snapshot, bool) {
 	if !ok {
 		return nil, false
 	}
-	c := *sn
-	return &c, true
+	return cloneSnapshot(sn), true
 }
 
 func (s *Store) DeleteSnapshot(id string) error {
@@ -428,7 +588,7 @@ func (s *Store) DeleteSnapshot(id string) error {
 	if _, ok := s.snapshots[id]; !ok {
 		return apperr.NotFoundErr("snapshot")
 	}
-	if err := s.append(fkSnapshot, "del", id, nil); err != nil {
+	if err := s.appendLocked(fkSnapshot, "del", id, nil); err != nil {
 		return err
 	}
 	delete(s.snapshots, id)
@@ -443,7 +603,7 @@ func (s *Store) ListSnapshots(tenantID string) []*domain.Snapshot {
 		if tenantID != "" && sn.TenantID != tenantID {
 			continue
 		}
-		out = append(out, func() *domain.Snapshot { c := *sn; return &c }())
+		out = append(out, cloneSnapshot(sn))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
 	return out
@@ -481,12 +641,12 @@ func (s *Store) PutTemplate(t *domain.Template) error {
 	if t.Version == 0 {
 		t.Version = 1
 	}
-	if err := s.append(fkTemplate, "put", t.ID, t); err != nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.appendLocked(fkTemplate, "put", t.ID, t); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	s.templates[t.ID] = t
-	s.mu.Unlock()
+	s.templates[t.ID] = cloneTemplate(t)
 	return nil
 }
 
@@ -497,8 +657,7 @@ func (s *Store) GetTemplate(id string) (*domain.Template, bool) {
 	if !ok {
 		return nil, false
 	}
-	c := *t
-	return &c, true
+	return cloneTemplate(t), true
 }
 
 func (s *Store) DeleteTemplate(id string) error {
@@ -507,7 +666,7 @@ func (s *Store) DeleteTemplate(id string) error {
 	if _, ok := s.templates[id]; !ok {
 		return apperr.NotFoundErr("template")
 	}
-	if err := s.append(fkTemplate, "del", id, nil); err != nil {
+	if err := s.appendLocked(fkTemplate, "del", id, nil); err != nil {
 		return err
 	}
 	delete(s.templates, id)
@@ -522,27 +681,90 @@ func (s *Store) ListTemplates(tenantID string) []*domain.Template {
 		if !t.Public && t.TenantID != tenantID {
 			continue
 		}
-		out = append(out, func() *domain.Template { c := *t; return &c }())
+		out = append(out, cloneTemplate(t))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
+}
+
+// ---- usage (metering) -------------------------------------------------------
+
+func cloneUsage(u *domain.Usage) *domain.Usage {
+	if u == nil {
+		return nil
+	}
+	c := *u
+	return &c
+}
+
+// GetUsage returns a tenant's persisted usage record, or nil when none exists
+// yet (a tenant with no sampled activity).
+func (s *Store) GetUsage(tenantID string) (*domain.Usage, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	u, ok := s.usages[tenantID]
+	if !ok {
+		return nil, false
+	}
+	return cloneUsage(u), true
+}
+
+// UpdateUsage applies fn to a tenant's usage record, creating it on first
+// sight. It is CAS-free: the metering loop is the sole writer, and its
+// cadence (one frame per tenant per flush) makes a compare-and-set pointless —
+// the only writer that can conflict with itself is a graceful shutdown flush.
+func (s *Store) UpdateUsage(tenantID string, fn func(u *domain.Usage) error) (*domain.Usage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok := s.usages[tenantID]
+	if !ok {
+		cur = domain.NewUsage(tenantID)
+	}
+	next := cloneUsage(cur)
+	if err := fn(next); err != nil {
+		return nil, err
+	}
+	next.Version = cur.Version + 1
+	next.UpdatedAt = time.Now().UTC()
+	if err := s.appendLocked(fkUsage, "put", tenantID, next); err != nil {
+		return nil, err
+	}
+	s.usages[tenantID] = next
+	return cloneUsage(next), nil
+}
+
+// ListUsage returns every persisted usage record, for platform-wide metering.
+func (s *Store) ListUsage() []*domain.Usage {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*domain.Usage, 0, len(s.usages))
+	for _, u := range s.usages {
+		out = append(out, cloneUsage(u))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].TenantID < out[j].TenantID })
 	return out
 }
 
 // ---- events (append-only) ---------------------------------------------------
 
 // AppendEvent persists one audit event. Events are never updated or deleted.
+//
+// This runs on the authentication-failure path, so it is the highest-frequency
+// fsync in the product. Callers that can be reached without credentials must
+// throttle before calling it (see httpapi's pre-auth limiter), or an
+// unauthenticated flood turns into one fsync per request.
 func (s *Store) AppendEvent(ev *domain.AuditEvent) error {
-	if err := s.append(fkEvent, "put", ev.ID, ev); err != nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.appendLocked(fkEvent, "put", ev.ID, ev); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	s.events = append(s.events, ev)
+	s.events = append(s.events, cloneEvent(ev))
 	if len(s.events) > s.opts.MaxEvents {
 		// drop oldest in bulk to avoid slice thrash
 		drop := s.opts.MaxEvents / 10
 		s.events = s.events[drop:]
 	}
-	s.mu.Unlock()
 	return nil
 }
 
@@ -584,7 +806,7 @@ func (s *Store) ListEvents(q EventQuery) []*domain.AuditEvent {
 		if !ev.TS.Before(q.Before) {
 			continue
 		}
-		out = append(out, ev)
+		out = append(out, cloneEvent(ev))
 	}
 	return out
 }
@@ -653,6 +875,7 @@ func (s *Store) marshalAll() ([]byte, error) {
 		Sandboxes []*domain.Sandbox    `json:"sandboxes"`
 		Snapshots []*domain.Snapshot   `json:"snapshots"`
 		Templates []*domain.Template   `json:"templates"`
+		Usages    []*domain.Usage      `json:"usages"`
 		Events    []*domain.AuditEvent `json:"events"`
 	}{}
 	for _, t := range s.tenants {
@@ -669,6 +892,9 @@ func (s *Store) marshalAll() ([]byte, error) {
 	}
 	for _, t := range s.templates {
 		all.Templates = append(all.Templates, t)
+	}
+	for _, u := range s.usages {
+		all.Usages = append(all.Usages, u)
 	}
 	all.Events = s.events
 	blob, err := json.MarshalIndent(all, "", " ")

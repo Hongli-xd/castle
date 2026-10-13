@@ -16,6 +16,14 @@ var testLimits = Limits{
 	MaxMetadataBytes:  1024,
 }
 
+func manyMounts(n int) []MountSpec {
+	out := make([]MountSpec, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, MountSpec{Source: "/srv/" + string(rune('a'+i)), Target: "/mnt" + string(rune('a'+i))})
+	}
+	return out
+}
+
 func TestStateMachineLegalTransitions(t *testing.T) {
 	legal := [][2]SandboxState{
 		{StateProvisioning, StateRunning},
@@ -103,6 +111,18 @@ func TestSpecValidation(t *testing.T) {
 			WorkDir: "relative"}, false},
 		{"bad user", SandboxSpec{CPUMillicores: 500, MemoryMiB: 256, TimeoutSeconds: 3600,
 			User: "-evil"}, false},
+		{"mount ok", SandboxSpec{CPUMillicores: 500, MemoryMiB: 256, TimeoutSeconds: 3600,
+			Mounts: []MountSpec{{Source: "/srv/proj", Target: "/workspace"}}}, true},
+		{"mount relative source", SandboxSpec{CPUMillicores: 500, MemoryMiB: 256, TimeoutSeconds: 3600,
+			Mounts: []MountSpec{{Source: "relative", Target: "/workspace"}}}, false},
+		{"mount traversal source", SandboxSpec{CPUMillicores: 500, MemoryMiB: 256, TimeoutSeconds: 3600,
+			Mounts: []MountSpec{{Source: "/srv/../etc", Target: "/workspace"}}}, false},
+		{"mount target is root", SandboxSpec{CPUMillicores: 500, MemoryMiB: 256, TimeoutSeconds: 3600,
+			Mounts: []MountSpec{{Source: "/srv/proj", Target: "/"}}}, false},
+		{"mount traversal target", SandboxSpec{CPUMillicores: 500, MemoryMiB: 256, TimeoutSeconds: 3600,
+			Mounts: []MountSpec{{Source: "/srv/proj", Target: "/safe/../escape"}}}, false},
+		{"mount too many", SandboxSpec{CPUMillicores: 500, MemoryMiB: 256, TimeoutSeconds: 3600,
+			Mounts: manyMounts(9)}, false},
 	}
 	for _, tc := range cases {
 		err := tc.spec.Validate(testLimits, 0)

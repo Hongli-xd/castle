@@ -13,8 +13,28 @@ type Quotas struct {
 	defaults domain.TenantQuota
 }
 
+// NewQuotas copies the platform defaults. The copy must be deep for Rates: a
+// plain struct copy shares the map, so a later mutation of config.Defaults
+// would silently rewrite the rates already handed to a running Quotas, and
+// RateFor would return a policy nobody configured.
 func NewQuotas(st *store.Store, defaults domain.TenantQuota) *Quotas {
-	return &Quotas{store: st, defaults: defaults}
+	return &Quotas{store: st, defaults: cloneQuota(defaults)}
+}
+
+func cloneQuota(q domain.TenantQuota) domain.TenantQuota {
+	c := q
+	if q.Rates != nil {
+		c.Rates = make(map[string]*domain.Rate, len(q.Rates))
+		for g, r := range q.Rates {
+			if r == nil {
+				c.Rates[g] = nil
+				continue
+			}
+			rc := *r
+			c.Rates[g] = &rc
+		}
+	}
+	return c
 }
 
 // Effective merges tenant quota over platform defaults.

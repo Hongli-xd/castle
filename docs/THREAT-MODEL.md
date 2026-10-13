@@ -31,10 +31,14 @@ microVM 后端路线图缓解）、DoS 网络洪泛（由部署侧 LBS/防火墙
    请求 `disk_mib` 的创建被 501 拒绝；仅当运维显式 `enforce_disk_quota=false`
    时才放行（启动日志有 WARNING）。一个租户写满共享盘的风险由该运维决策承担。
 3. **egress 白名单不可强制**：容器后端无法实施内核级出口过滤。请求
-   `egress.mode=allowlist` 的创建被 501 拒绝（TestAllowlistIsRefusedNotIgnored 级别的
-   测试锁死该行为）。`none`（默认）是唯一可强制的出口策略。
-4. **限流的近似性**：并发创建的配额检查存在竞窗（两个同时创建可短暂越过
-   软上限 1 个），上限在下一次准入时生效——标准准入控制语义，不是精确记账。
+   `egress.mode=allowlist` 的创建被 501 拒绝（由
+   `TestIsolationContract/unenforceable_limits_are_refused_not_silently_ignored` 锁死，
+   该场景同时锁死 `disk_mib` 的 501）。`none`（默认）是唯一可强制的出口策略。
+4. **限流的近似性**：并发创建的配额检查存在竞窗，上限在下一次准入时生效——标准准入
+   控制语义，不是精确记账。**实测幅度**：20 路并发创建对上限 5，20 个全部放行
+   （越限 15），突发结束后下一次创建被 402 拒绝。越限幅度被在途创建数封顶，受
+   `create_queue_timeout` 与 `max_concurrent_creates` 约束。见
+   [SECURITY-CONTRACT.md](SECURITY-CONTRACT.md) §5。
 
 ## 3. 调用方 → 平台与他租户
 
@@ -55,7 +59,8 @@ microVM 后端路线图缓解）、DoS 网络洪泛（由部署侧 LBS/防火墙
 
 - **审计不可变**：审计事件只追加；daemon 崩溃不丢已确认事件（WAL fsync）。
 - **密钥卫生**：日志、错误、审计 detail 中不含 Key 明文/文件内容/env 值
-  （tests/security.sh 自动验证）。
+  （`TestSecretsNeverReachTheLog` 自动验证，含"运维在配置里提供的 bootstrap key
+  不再被回显到 stdout/journal"这条回归）。
 - **崩溃一致性**：状态变更 = 一条 WAL 帧；撕裂尾部重启自动截断；过渡态
   （provisioning/pausing/resuming/stopping）在重启后由 reconciler 向后端重新对账。
 - **孤儿回收**：带产品标签但无记录的后端对象（崩溃残留）由 reconciler 收割；
@@ -65,16 +70,31 @@ microVM 后端路线图缓解）、DoS 网络洪泛（由部署侧 LBS/防火墙
 
 ## 5. 验证矩阵
 
-以上每一条声明都有对应测试（商用门槛，全部必须在交付前通过）：
+以上每一条声明都有对应测试（商用门槛，全部必须在交付前通过）。全部端到端断言都在
+`tests/` 下的 Go 套件里，共用一个 harness（daemon 生命周期、带类型客户端、沙箱夹具），
+取代了早期六份各自重复三十行样板（写配置→pkill→rm -rf→启动→sleep→从日志里 grep 出
+admin key）的 shell 脚本。
 
 | 声明 | 测试 |
 |---|---|
-| 认证拒绝/防篡改 | tests/security.sh（伪造 Key、真实前缀篡改） |
-| IDOR | tests/security.sh（跨租户 read/exec/delete/snapshot/events） |
-| 路径穿越/体积/env 洪水 | tests/security.sh |
-| 诚实拒绝（egress/disk） | tests/security.sh（501 断言） |
-| 密钥不泄漏 | tests/security.sh（日志与响应体扫描） |
-| OOM 真实生效 | internal/runtime/oci 集成测试（64MiB 内堆增长被杀） |
-| exec 超时真实生效 | internal/runtime/oci 集成测试 |
-| 崩溃收敛 | tests/chaos.sh（kill -9 三场景） |
-| 限流真实生效 | internal/httpapi HTTP 级测试 + 冒烟实测 |
+| 隔离逐层生效（22 项，从沙箱内部读内核事实） | `TestIsolationContract` |
+| daemon 自检与本套件结论一致 | `TestIsolationContract/the_self_check_inventory_agrees_with_this_suite` |
+| 认证拒绝/防篡改 | `TestAuthenticationAndScope/credential_rejections_are_all_401` |
+| IDOR | `TestAuthenticationAndScope/cross_tenant_access_is_forbidden_on_every_resource` |
+| 路径穿越/体积/env 洪水 | `TestQuotaAndAdmission/specs_outside_platform_limits_are_rejected_with_a_reason` |
+| 诚实拒绝（egress/disk，501 断言） | `TestIsolationContract/unenforceable_limits_are_refused_not_silently_ignored` |
+| 密钥不泄漏 | `TestSecretsNeverReachTheLog` |
+| OOM 真实生效 | `TestMemoryBombIsContained`（64 MiB 上限下 exit 137） |
+| fork 炸弹遏制 | `TestForkBombIsContained` |
+| CPU 配额不饿死控制面 | `TestCPUBurnDoesNotStarveTheControlPlane` |
+| 爆炸半径 = 沙箱本身 | `TestBlastRadiusIsTheSandbox`（宿主金丝雀与 `/etc/hosts` 逐字节未变） |
+| exec 超时真实生效 | `internal/runtime/oci` 集成测试 |
+| 崩溃收敛 | `TestCrashRecovery`（kill -9 四场景，含连续三次崩溃的 WAL 完整性） |
+| 灾难恢复（PITR） | `TestPointInTimeRecovery`（备份后创建的状态必须不存在） |
+| 限流真实生效 | `internal/httpapi` HTTP 级测试 + `TestQuotaAndAdmission` |
+| 配额准入语义（收敛而非瞬时精确） | `TestQuotaAdmissionIsBestEffortButConverges` |
+| 孤儿镜像回收 | `TestOrphanedSnapshotImagesAreReaped`、`TestSnapshotsDoNotLeakImages` |
+| 后端不可达时的降级表现 | `TestBackendOutageIsDisclosedAndRecovers`（`SBX_IT_DESTRUCTIVE=1` 门控） |
+
+按客户可核对的承诺清单、逐层证据与**明确不承诺**的边界，见
+[SECURITY-CONTRACT.md](SECURITY-CONTRACT.md)。

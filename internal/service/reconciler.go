@@ -224,6 +224,64 @@ func (s *Service) reconcile(ctx context.Context, atBoot bool) {
 		})
 	}
 
+	reaped += s.reapOrphanedImages(ctx)
+}
+
+// reapOrphanedImages removes snapshot/template images no record references.
+//
+// These images are tagged (sandboxd-snap-<id>), so they are not *dangling* and
+// no engine GC will ever remove them. If the data directory is lost, restored
+// from before a commit, or simply replaced when a node is rebuilt, the images
+// survive with nothing pointing at them, and each one is a full copy of a
+// sandbox filesystem. On the machine this was written on, ninety such images
+// had accumulated. The check below is the only thing that ever deletes them.
+//
+// The dangerous direction is the opposite one: deleting an image a live
+// sandbox is still running from. A sandbox created from a snapshot keeps that
+// snapshot's image ref, so every non-terminal sandbox's image is protected,
+// not just the snapshot records.
+func (s *Service) reapOrphanedImages(ctx context.Context) int {
+	managed, err := s.Backend.ManagedImages(ctx)
+	if err != nil {
+		return 0 // backend cannot enumerate them; leave the node alone
+	}
+	if len(managed) == 0 {
+		return 0
+	}
+
+	live := map[string]bool{}
+	s.St.ForEachSnapshot(func(sn *domain.Snapshot) bool {
+		live[sn.ImageRef] = true
+		return true
+	})
+	s.St.ForEachTemplate(func(tpl *domain.Template) bool {
+		live[tpl.ImageRef] = true
+		return true
+	})
+	s.St.ForEachSandbox(func(sb *domain.Sandbox) bool {
+		// A stopped sandbox can never be resumed (stop is terminal), but its
+		// record is still an operator-visible thing; the conservative and
+		// cheap choice is to protect every recorded image and let the record
+		// deletion be the event that frees it.
+		live[sb.Backend.ImageRef] = true
+		return true
+	})
+
+	n := 0
+	for _, img := range managed {
+		if live[img] {
+			continue
+		}
+		if err := s.Backend.RemoveImage(ctx, img); err == nil {
+			n++
+		}
+	}
+	if n > 0 {
+		_ = s.Audit.Record("", "", "system", domain.ActReconcileFix, map[string]string{
+			"note": "reaped orphaned snapshot images", "images": itoa(n),
+		})
+	}
+	return n
 }
 
 func backendToState(st runtime.Status) domain.SandboxState {
