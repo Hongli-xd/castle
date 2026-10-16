@@ -14,9 +14,10 @@ import (
 //
 // The pool keeps N pristine *started* containers per public template.
 // Pristine is the safety property: warm containers have never executed a
-// workload, so handing one to any tenant leaks nothing. Adoption renames the
-// container to its sandbox identity before the record exists — a crash in
-// between leaves an adoptable orphan the reconciler reaps by age.
+// workload, so handing one to any tenant leaks nothing. Adoption keeps the
+// warm container's existing name and points the record at it — the record is
+// the handoff point, so a crash before it leaves an orphan the reconciler
+// reaps by age.
 
 type poolItem struct {
 	ref      string
